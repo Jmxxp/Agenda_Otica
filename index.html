@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sistema Ótica - Agendamentos</title>
+  <meta name="theme-color" content="#0b0e1a">
+  <link rel="stylesheet" href="css/styles.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+</head>
+<body>
+
+  <!-- ═══ LOADING ═══ -->
+  <div id="loading">
+    <div class="spinner"></div>
+    <span class="spinner-text">Carregando</span>
+  </div>
+
+  <!-- ═══ LOGIN ═══ -->
+  <div id="login" class="hidden">
+    <div class="login-box">
+      <div class="login-logo">
+        <i class="fas fa-glasses"></i>
+        <h1>Sistema Ótica</h1>
+        <p>Selecione sua loja para entrar</p>
+      </div>
+
+      <div class="stores-grid" id="stores-grid"></div>
+
+      <div id="pwd-section" class="pwd-section hidden">
+        <label>Senha da Loja</label>
+        <div class="pwd-row">
+          <input type="password" id="pwd-input" placeholder="••••••••">
+          <button class="btn-login" id="btn-enter">Entrar</button>
+        </div>
+      </div>
+
+      <div class="login-hint">Senha padrão: <strong>1234</strong></div>
+    </div>
+  </div>
+
+  <!-- ═══ APP ═══ -->
+  <div id="app" class="hidden">
+
+    <!-- Sidebar -->
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-brand">
+        <i class="fas fa-glasses"></i>
+        <span>Sistema Ótica</span>
+      </div>
+
+      <div class="store-badge" id="store-badge">
+        <span class="dot"></span>
+        <span>Loja 1</span>
+      </div>
+
+      <!-- Mini Calendar -->
+      <div class="mini-cal">
+        <div class="mini-cal-header">
+          <button id="cal-prev"><i class="fas fa-chevron-left"></i></button>
+          <span id="cal-title">FEVEREIRO 2026</span>
+          <button id="cal-next"><i class="fas fa-chevron-right"></i></button>
+        </div>
+        <div class="mini-cal-weekdays">
+          <span class="domingo">D</span><span>S</span><span>T</span><span>Q</span><span>Q</span><span>S</span><span>S</span>
+        </div>
+        <div class="mini-cal-days" id="cal-days"></div>
+      </div>
+
+      <!-- View Toggle -->
+      <div class="view-toggle" id="view-toggle">
+        <button class="view-btn active" data-view="geral"><i class="fas fa-th"></i> Geral</button>
+        <button class="view-btn" data-view="simplificado"><i class="fas fa-columns"></i> Simplificado</button>
+      </div>
+
+      <!-- Nav -->
+
+      <div class="sidebar-footer">
+        <button class="btn-logout" id="btn-logout">
+          <i class="fas fa-sign-out-alt"></i>
+          <span>Sair</span>
+        </button>
+      </div>
+    </aside>
+
+    <!-- Main -->
+    <div class="main">
+      <!-- Header -->
+      <header class="header">
+        <div class="header-date">
+          <span class="day-num" id="h-day">21</span>
+          <div class="day-info">
+            <span class="weekday" id="h-weekday">SÁBADO</span>
+            <span class="month-year" id="h-monthyear">FEVEREIRO 2026</span>
+          </div>
+        </div>
+
+        <div class="header-actions">
+          <div class="conn-status offline" id="conn-status">
+            <span class="pulse"></span>Offline
+          </div>
+          <button class="btn-icon" id="btn-today" title="Hoje">
+            <i class="fas fa-calendar-day"></i>
+          </button>
+          <button class="btn-icon" id="nav-config" title="Configurar">
+            <i class="fas fa-cog"></i>
+          </button>
+          <button class="btn-icon" id="btn-refresh" title="Atualizar">
+            <i class="fas fa-sync-alt"></i>
+          </button>
+          <button class="btn-icon" id="btn-console" title="Console">
+            <i class="fas fa-terminal"></i>
+          </button>
+          <button class="btn-icon danger" id="btn-clear" title="Limpar Tudo">
+            <i class="fas fa-trash-alt"></i>
+          </button>
+        </div>
+      </header>
+
+      <!-- Schedule -->
+      <div class="schedule-wrap" id="schedule">
+        <!-- Rendered by JS -->
+      </div>
+    </div>
+  </div>
+
+  <!-- Debug Console -->
+  <div id="debug-console" class="debug-console hidden">
+    <div class="debug-header">
+      <span><i class="fas fa-terminal"></i> Console</span>
+      <div>
+        <button id="debug-clear" title="Limpar"><i class="fas fa-eraser"></i></button>
+        <button onclick="App.toggleConsole()" title="Fechar">&times;</button>
+      </div>
+    </div>
+    <div id="debug-log" class="debug-log"></div>
+  </div>
+
+  <!-- Toasts -->
+  <div class="toast-wrap" id="toasts"></div>
+
+  <!-- Scripts -->
+  <script src="js/sheets.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
