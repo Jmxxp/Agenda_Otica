@@ -1705,9 +1705,9 @@ const App = {
     scope.querySelectorAll('.rx-input').forEach(input => {
       input.addEventListener('keydown', event => {
         const key = event.key.toLowerCase();
-        if (key !== 'p' && key !== 'n') return;
+        if (!['p', '=', 'n'].includes(key)) return;
         event.preventDefault();
-        const sign = key === 'p' ? '+' : '-';
+        const sign = key === 'n' ? '-' : '+';
         input.setRangeText(sign, input.selectionStart, input.selectionEnd, 'end');
         input.dispatchEvent(new Event('input', { bubbles: true }));
       });
