@@ -286,13 +286,44 @@ const DB = {
       throw new Error('Apenas administradores podem editar lojas');
     }
 
-    const { data, error } = await this.client.rpc('admin_update_store', {
-      p_store_id: storeId,
-      p_name: payload.name,
-      p_login_nick: payload.nick,
-      p_password: payload.password || null,
-      p_color: payload.color,
-    });
+    const current = this.getStore(storeId);
+    const clean = {
+      name: payload.name.trim(),
+      nick: normalizeNick(payload.nick),
+      password: String(payload.password || ''),
+      color: payload.color || current?.color || '#2563eb',
+    };
+
+    try {
+      const { data, error } = await this.client.rpc('admin_update_store', {
+        p_store_id: storeId,
+        p_name: clean.name,
+        p_login_nick: clean.nick,
+        p_password: clean.password || null,
+        p_color: clean.color,
+      });
+
+      if (error) throw error;
+      await this.refresh();
+      return data;
+    } catch (error) {
+      if (!isMissingRpcError(error)) throw error;
+
+      const nickChanged = current && clean.nick !== current.login_nick;
+      if (nickChanged || clean.password) {
+        throw new Error('A funcao admin_update_store precisa ser atualizada no Supabase para alterar nick ou senha.');
+      }
+    }
+
+    const { data, error } = await this.client
+      .from('stores')
+      .update({
+        name: clean.name,
+        color: clean.color,
+      })
+      .eq('id', storeId)
+      .select()
+      .single();
 
     if (error) throw error;
     await this.refresh();
@@ -389,8 +420,36 @@ const DB = {
   },
 
   async removeAppointment(id) {
-    const { error } = await this.client.from('appointments').delete().eq('id', id);
+    const { data, error } = await this.client
+      .from('appointments')
+      .delete()
+      .eq('id', id)
+      .select('id');
     if (error) throw error;
+    if (!data?.length) {
+      throw new Error('Nao foi possivel excluir. Verifique as permissoes da tabela appointments no Supabase.');
+    }
+    await this.refresh();
+  },
+
+  async removeClient(id) {
+    const client = this.getClient(id);
+    if (!client || !this.canManageStore(client.store_id)) {
+      throw new Error('Voce nao pode excluir este cliente');
+    }
+
+    const { data, error } = await this.client
+      .from('clients')
+      .delete()
+      .eq('id', id)
+      .select('id');
+    if (error?.code === '23503') {
+      throw new Error('Este cliente possui agendamentos vinculados. Exclua ou edite esses agendamentos primeiro.');
+    }
+    if (error) throw error;
+    if (!data?.length) {
+      throw new Error('Nao foi possivel excluir. Verifique as permissoes da tabela clients no Supabase.');
+    }
     await this.refresh();
   },
 };
@@ -873,14 +932,13 @@ const App = {
     const dateValue = isSunday(this.selDate) ? this.fmtDate(nextOpenDate(this.selDate)) : this.fmtDate(this.selDate);
     const initialTimes = getTimesForDate(parseLocalDate(dateValue));
     const time = defaults.time || initialTimes[0] || '08:00';
-
-    this.openModal(`<div class="modal-head">
-      <h3>Novo agendamento</h3>
-      <button class="modal-close">&times;</button>
-    </div>
-    <form class="modal-body form-stack" id="appointment-form">
-      <label>Loja
-        <select id="apt-store" ${DB.profile.role === 'store' ? 'disabled' : ''}>
+    const hideSlotFields = DB.profile.role === 'store';
+    const slotFields = hideSlotFields
+      ? `<input type="hidden" id="apt-store" value="${esc(store.id)}">
+        <input type="hidden" id="apt-date" value="${dateValue}">
+        <input type="hidden" id="apt-time" value="${time}">`
+      : `<label>Loja
+        <select id="apt-store">
           ${allowedStores.map(s => `<option value="${s.id}" ${s.id === store.id ? 'selected' : ''}>${esc(s.name)}</option>`).join('')}
         </select>
       </label>
@@ -891,7 +949,14 @@ const App = {
         <label>Horario
           <select id="apt-time">${initialTimes.map(t => `<option value="${t}" ${t === time ? 'selected' : ''}>${t}</option>`).join('')}</select>
         </label>
-      </div>
+      </div>`;
+
+    this.openModal(`<div class="modal-head">
+      <h3>Novo agendamento</h3>
+      <button class="modal-close">&times;</button>
+    </div>
+    <form class="modal-body form-stack" id="appointment-form">
+      ${slotFields}
       <label>Cliente
         <input type="text" id="apt-client" list="clients-list" placeholder="Nome completo" required>
         <datalist id="clients-list">
@@ -910,7 +975,10 @@ const App = {
       </div>
     </form>`);
 
-    document.getElementById('apt-store').onchange = event => {
+    const storeField = document.getElementById('apt-store');
+    const dateField = document.getElementById('apt-date');
+
+    if (storeField.tagName === 'SELECT') storeField.onchange = event => {
       const selected = DB.getStore(event.target.value);
       document.getElementById('clients-list').innerHTML = DB.clients
         .filter(c => c.store_id === selected.id)
@@ -918,7 +986,7 @@ const App = {
         .join('');
     };
 
-    document.getElementById('apt-date').onchange = event => {
+    if (dateField.type === 'date') dateField.onchange = event => {
       const date = parseLocalDate(event.target.value);
       const times = getTimesForDate(date);
       document.getElementById('apt-time').innerHTML = times.map(t => `<option value="${t}">${t}</option>`).join('');
@@ -1082,11 +1150,24 @@ const App = {
       <label>Observacoes
         <textarea id="client-notes">${esc(client?.notes || '')}</textarea>
       </label>
-      <div class="modal-foot">
+      <div class="modal-foot client-actions">
         <button class="btn btn-secondary modal-close" type="button">Cancelar</button>
+        ${client ? '<button class="btn btn-danger" type="button" id="delete-client"><i class="fas fa-trash"></i> Excluir</button>' : ''}
         <button class="btn btn-primary" type="submit">Salvar</button>
       </div>
     </form>`);
+
+    document.getElementById('delete-client')?.addEventListener('click', async () => {
+      if (!confirm('Excluir este cliente?')) return;
+      try {
+        await DB.removeClient(client.id);
+        this.closeModal();
+        this.render();
+        this.toast('Cliente excluido', 'success');
+      } catch (err) {
+        this.toast(err.message, 'error');
+      }
+    });
 
     document.getElementById('client-form').onsubmit = async event => {
       event.preventDefault();
@@ -1350,6 +1431,13 @@ function sameDate(a, b) {
 function parseLocalDate(value) {
   const [y, m, d] = value.split('-').map(Number);
   return new Date(y, m - 1, d);
+}
+
+function isMissingRpcError(error) {
+  const message = String(error?.message || '');
+  return error?.code === 'PGRST202'
+    || message.includes('Could not find the function public.admin_update_store')
+    || message.includes('schema cache');
 }
 
 function labelStatus(value) {
