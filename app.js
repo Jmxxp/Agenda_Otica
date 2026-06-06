@@ -16,8 +16,11 @@ const DB = {
   user: null,
   profile: null,
   stores: [],
+  optometrists: [],
   clients: [],
   appointments: [],
+  prescriptionNotifications: [],
+  prescriptionNotificationsAvailable: true,
   lastSync: null,
   timer: null,
   realtimeChannel: null,
@@ -97,17 +100,20 @@ const DB = {
     this.user = null;
     this.profile = null;
     this.stores = [];
+    this.optometrists = [];
     this.clients = [];
     this.appointments = [];
+    this.prescriptionNotifications = [];
     if (this.client) await this.client.auth.signOut();
   },
 
   async refresh() {
-    const [profile, storesRes, appointmentsRes, clientsRes] = await Promise.all([
+    const [profile, storesRes, appointmentsRes, clientsRes, optometrists] = await Promise.all([
       this.user ? this.getProfile() : Promise.resolve(null),
       this.client.from('stores').select('*').order('name', { ascending: true }),
       this.client.from('appointments').select('*').order('date', { ascending: true }).order('time', { ascending: true }),
       this.client.from('clients').select('*').order('name', { ascending: true }),
+      this.loadOptometrists(),
     ]);
 
     if (storesRes.error) throw storesRes.error;
@@ -116,10 +122,41 @@ const DB = {
 
     if (profile) this.profile = profile;
     this.stores = storesRes.data || [];
+    this.optometrists = optometrists || [];
     this.appointments = appointmentsRes.data || [];
     this.clients = clientsRes.data || [];
+    this.prescriptionNotifications = await this.loadPrescriptionNotifications();
     this.lastSync = new Date();
     return true;
+  },
+
+  async loadOptometrists() {
+    if (this.profile?.role !== 'admin') return [];
+    const { data, error } = await this.client
+      .from('profiles')
+      .select('*')
+      .eq('role', 'optometrist')
+      .order('full_name', { ascending: true });
+    if (error) throw error;
+    return data || [];
+  },
+
+  async loadPrescriptionNotifications() {
+    if (this.profile?.role !== 'store' || !this.profile.store_id) return [];
+    const { data, error } = await this.client
+      .from('prescription_notifications')
+      .select('*')
+      .eq('store_id', this.profile.store_id)
+      .order('created_at', { ascending: false })
+      .limit(30);
+
+    if (isMissingTableError(error)) {
+      this.prescriptionNotificationsAvailable = false;
+      return [];
+    }
+    if (error) throw error;
+    this.prescriptionNotificationsAvailable = true;
+    return data || [];
   },
 
   async startSync() {
@@ -141,12 +178,23 @@ const DB = {
     this.authSubscription = authData.subscription;
 
     const tables = ['stores', 'profiles', 'clients', 'appointments'];
+    if (this.prescriptionNotificationsAvailable) tables.push('prescription_notifications');
     let channel = this.client.channel(`agenda-realtime-${this.user?.id || Date.now()}`);
     tables.forEach(table => {
       channel = channel.on(
         'postgres_changes',
         { event: '*', schema: 'public', table },
-        () => this.queueRealtimeRefresh()
+        payload => {
+          if (
+            table === 'prescription_notifications'
+            && payload.eventType === 'INSERT'
+            && this.profile?.role === 'store'
+            && payload.new?.store_id === this.profile.store_id
+          ) {
+            App.toast('Nova receita recebida', 'info');
+          }
+          this.queueRealtimeRefresh();
+        }
       );
     });
 
@@ -210,8 +258,12 @@ const DB = {
     return this.clients.find(client => client.id === id);
   },
 
+  getOptometrist(id) {
+    return this.optometrists.find(profile => profile.id === id);
+  },
+
   canManageStore(storeId) {
-    return this.profile?.role === 'admin' || this.profile?.store_id === storeId;
+    return ['admin', 'optometrist'].includes(this.profile?.role) || this.profile?.store_id === storeId;
   },
 
   async createStore(payload) {
@@ -281,6 +333,111 @@ const DB = {
     return store;
   },
 
+  async createOptometrist(payload) {
+    if (this.profile?.role !== 'admin') {
+      throw new Error('Apenas administradores podem criar optometristas');
+    }
+
+    const nick = normalizeNick(payload.nick);
+    const authEmail = nickToAuthEmail(nick);
+
+    if (!payload.name?.trim() || nick.length < 3 || String(payload.password || '').length < 6) {
+      throw new Error('Informe nome, nick com pelo menos 3 caracteres e senha com pelo menos 6 caracteres');
+    }
+
+    const nickInStores = this.stores.some(store => store.login_nick === nick || store.auth_email === authEmail);
+    const nickInOptometrists = this.optometrists.some(profile => profile.login_nick === nick || profile.auth_email === authEmail);
+    if (nickInStores || nickInOptometrists) {
+      throw new Error('Este nick ja esta em uso');
+    }
+
+    const authClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, {
+      auth: {
+        persistSession: false,
+        autoRefreshToken: false,
+        detectSessionInUrl: false,
+      },
+    });
+
+    const { data: authData, error: authError } = await authClient.auth.signUp({
+      email: authEmail,
+      password: payload.password,
+      options: { data: { name: payload.name.trim(), nick, role: 'optometrist' } },
+    });
+
+    if (authError) {
+      if (String(authError.message || '').toLowerCase().includes('already')) {
+        throw new Error(`Este nick ja existe no Auth do Supabase (${authEmail}), mas pode estar sem perfil. Rode o SQL de limpar usuario orfao ou use outro nick.`);
+      }
+      throw authError;
+    }
+    if (!authData.user?.id) {
+      throw new Error('Nao foi possivel criar o login do optometrista. Confira o cadastro de usuarios no Supabase.');
+    }
+
+    const { data, error } = await this.client
+      .from('profiles')
+      .insert({
+        id: authData.user.id,
+        role: 'optometrist',
+        full_name: payload.name.trim(),
+        login_nick: nick,
+        auth_email: authEmail,
+        created_by: this.user.id,
+      })
+      .select()
+      .single();
+
+    if (error) throw error;
+    await this.refresh();
+    return data;
+  },
+
+  async updateOptometrist(profileId, payload) {
+    if (this.profile?.role !== 'admin') {
+      throw new Error('Apenas administradores podem editar optometristas');
+    }
+
+    const current = this.getOptometrist(profileId);
+    const nick = normalizeNick(payload.nick);
+    const authEmail = nickToAuthEmail(nick);
+    const password = String(payload.password || '');
+
+    if (!payload.name?.trim() || nick.length < 3) {
+      throw new Error('Informe nome e nick com pelo menos 3 caracteres');
+    }
+    if (password && password.length < 6) {
+      throw new Error('A senha precisa ter pelo menos 6 caracteres');
+    }
+
+    const nickInStores = this.stores.some(store => store.login_nick === nick || store.auth_email === authEmail);
+    const nickInOptometrists = this.optometrists.some(profile => {
+      return profile.id !== profileId && (profile.login_nick === nick || profile.auth_email === authEmail);
+    });
+    if (nickInStores || nickInOptometrists) {
+      throw new Error('Este nick ja esta em uso');
+    }
+
+    const { data, error } = await this.client.rpc('admin_update_optometrist', {
+      p_profile_id: profileId,
+      p_name: payload.name.trim(),
+      p_login_nick: nick,
+      p_password: password || null,
+    });
+
+    if (isMissingRpcError(error)) {
+      throw new Error('A funcao admin_update_optometrist precisa ser criada no Supabase para editar login do optometrista.');
+    }
+    if (error) throw error;
+
+    if (!data && current) {
+      throw new Error('Nao foi possivel atualizar este optometrista');
+    }
+
+    await this.refresh();
+    return data;
+  },
+
   async updateStore(storeId, payload) {
     if (this.profile?.role !== 'admin') {
       throw new Error('Apenas administradores podem editar lojas');
@@ -332,6 +489,9 @@ const DB = {
 
   async saveClient(payload) {
     const current = payload.id ? this.getClient(payload.id) : null;
+    const nextPrescription = payload.prescription?.trim() || '';
+    const currentPrescription = current?.prescription?.trim() || '';
+    const prescriptionChanged = payload.prescription !== undefined && nextPrescription !== currentPrescription;
     const clean = {
       store_id: payload.store_id,
       name: payload.name.trim(),
@@ -341,6 +501,12 @@ const DB = {
       created_by: this.user.id,
     };
 
+    if (payload.prescription !== undefined) {
+      clean.prescription = nextPrescription || null;
+      clean.prescription_updated_at = prescriptionChanged ? new Date().toISOString() : current?.prescription_updated_at || null;
+      clean.prescription_updated_by = prescriptionChanged ? this.user.id : current?.prescription_updated_by || null;
+    }
+
     if (payload.id) {
       const { data, error } = await this.client
         .from('clients')
@@ -349,6 +515,7 @@ const DB = {
         .select()
         .single();
       if (error) throw error;
+      await this.notifyPrescriptionChange(data, prescriptionChanged);
       await this.refresh();
       return data;
     }
@@ -362,6 +529,7 @@ const DB = {
         .select()
         .single();
       if (error) throw error;
+      await this.notifyPrescriptionChange(data, prescriptionChanged);
       await this.refresh();
       return data;
     }
@@ -372,8 +540,42 @@ const DB = {
       .select()
       .single();
     if (error) throw error;
+    await this.notifyPrescriptionChange(data, prescriptionChanged);
     await this.refresh();
     return data;
+  },
+
+  async notifyPrescriptionChange(client, prescriptionChanged) {
+    if (!prescriptionChanged || !client?.prescription || this.profile?.role === 'store') return;
+
+    const store = this.getStore(client.store_id);
+    const { error } = await this.client
+      .from('prescription_notifications')
+      .insert({
+        store_id: client.store_id,
+        client_id: client.id,
+        client_name: client.name,
+        message: `Receita de ${client.name} enviada para ${store?.name || 'loja'}.`,
+        created_by: this.user.id,
+      });
+
+    if (isMissingTableError(error)) {
+      throw new Error('A tabela prescription_notifications ainda nao existe. Execute o SQL de receitas no Supabase.');
+    }
+    if (error) throw error;
+  },
+
+  async markPrescriptionNotificationsRead() {
+    if (this.profile?.role !== 'store' || !this.profile.store_id) return;
+
+    const { error } = await this.client
+      .from('prescription_notifications')
+      .update({ read_at: new Date().toISOString() })
+      .eq('store_id', this.profile.store_id)
+      .is('read_at', null);
+
+    if (error) throw error;
+    await this.refresh();
   },
 
   async saveAppointment(payload) {
@@ -383,6 +585,7 @@ const DB = {
       name: payload.client_name,
       phone: payload.client_phone,
       notes: payload.client_notes,
+      prescription: payload.client_prescription,
     });
 
     const clean = {
@@ -495,6 +698,7 @@ const App = {
     document.getElementById('app').classList.remove('hidden');
 
     this.updateAccountBadge();
+    this.updatePrescriptionNotifications();
     document.querySelectorAll('.admin-only').forEach(el => {
       el.classList.toggle('hidden', DB.profile.role !== 'admin');
     });
@@ -598,6 +802,7 @@ const App = {
     document.getElementById('btn-logout').onclick = () => this.logout();
     document.getElementById('btn-menu').onclick = () => document.getElementById('sidebar').classList.toggle('open');
     document.getElementById('btn-theme').onclick = () => this.toggleTheme();
+    document.getElementById('btn-prescription-notifications').onclick = () => this.openPrescriptionNotifications();
 
     document.querySelectorAll('.nav-btn').forEach(btn => {
       btn.addEventListener('click', () => {
@@ -632,6 +837,7 @@ const App = {
     this.updateDateHeader();
     this.renderCalendar();
     this.updateConnStatus();
+    this.updatePrescriptionNotifications();
 
     if (this.activeView === 'clients') this.renderClients();
     else if (this.activeView === 'admin') this.renderAdmin();
@@ -640,11 +846,31 @@ const App = {
 
   updateAccountBadge() {
     const store = DB.profile.stores;
-    const title = DB.profile.role === 'admin' ? 'Administrador' : store?.name || 'Loja';
-    const role = DB.profile.role === 'admin' ? 'acesso total' : 'loja';
+    const title = DB.profile.role === 'admin'
+      ? 'Administrador'
+      : DB.profile.role === 'optometrist'
+        ? 'Optometrista'
+        : store?.name || 'Loja';
+    const role = DB.profile.role === 'admin'
+      ? 'acesso total'
+      : DB.profile.role === 'optometrist'
+        ? 'agenda e receitas'
+        : 'loja';
     document.getElementById('badge-title').textContent = title;
     document.getElementById('badge-role').textContent = role;
     document.querySelector('#store-badge .dot').style.background = store?.color || '#111827';
+  },
+
+  updatePrescriptionNotifications() {
+    const button = document.getElementById('btn-prescription-notifications');
+    const count = document.getElementById('notification-count');
+    if (!button || !count) return;
+
+    const show = DB.profile?.role === 'store';
+    const unread = DB.prescriptionNotifications.filter(item => !item.read_at).length;
+    button.classList.toggle('hidden', !show);
+    count.textContent = String(unread);
+    count.classList.toggle('hidden', !unread);
   },
 
   updateDateHeader() {
@@ -793,7 +1019,7 @@ const App = {
 
       section.times.forEach(time => {
         const atTime = appointments.filter(apt => normalizeTime(apt.time) === time);
-        const canAdd = DB.profile.role === 'admin' || DB.profile.store_id;
+        const canAdd = ['admin', 'optometrist'].includes(DB.profile.role) || DB.profile.store_id;
         html += `<td class="${atTime.length ? 'filled' : 'empty'}" data-time="${time}">
           ${atTime.length ? atTime.map(apt => {
             const store = DB.getStore(apt.store_id);
@@ -822,9 +1048,8 @@ const App = {
   },
 
   renderClients() {
-    const canPickStore = DB.profile.role === 'admin';
     const canToggleAll = DB.profile.role === 'store';
-    const showingAll = DB.profile.role === 'admin' || this.clientsScope === 'all';
+    const showingAll = ['admin', 'optometrist'].includes(DB.profile.role) || this.clientsScope === 'all';
     const clients = showingAll
       ? [...DB.clients]
       : DB.clients.filter(client => client.store_id === DB.profile.store_id);
@@ -885,13 +1110,16 @@ const App = {
         <h2>Admin</h2>
         <p>Crie lojas, logins e acompanhe o movimento geral.</p>
       </div>
-      <button class="btn btn-primary" id="open-store-form"><i class="fas fa-store"></i> Nova loja</button>
+      <div class="toolbar-actions">
+        <button class="btn btn-secondary" id="open-optometrist-form"><i class="fas fa-user-doctor"></i> Optometrista</button>
+        <button class="btn btn-primary" id="open-store-form"><i class="fas fa-store"></i> Nova loja</button>
+      </div>
     </div>
     <div class="stat-grid">
       <div class="stat"><span>${DB.stores.length}</span><small>Lojas ativas</small></div>
       <div class="stat"><span>${DB.clients.length}</span><small>Clientes</small></div>
       <div class="stat"><span>${todayCount}</span><small>Hoje</small></div>
-      <div class="stat"><span>${DB.appointments.length}</span><small>Total agenda</small></div>
+      <div class="stat"><span>${DB.optometrists.length}</span><small>Optometristas</small></div>
     </div>
     <div class="panel">
       <div class="panel-head">
@@ -908,17 +1136,37 @@ const App = {
           <i class="fas fa-chevron-right"></i>
         </button>`).join('')}
       </div>` : this.emptyState('fa-store', 'Nenhuma loja cadastrada', 'Use o botao Nova loja para criar login e agenda da loja.')}
+    </div>
+    <div class="panel">
+      <div class="panel-head">
+        <h3>Optometristas</h3>
+        <span>${DB.optometrists.length} login(s)</span>
+      </div>
+      ${DB.optometrists.length ? `<div class="store-list">
+        ${DB.optometrists.map(profile => `<button class="store-row" data-optometrist-id="${profile.id}">
+          <span class="store-color optometrist-color"><i class="fas fa-user-doctor"></i></span>
+          <div>
+            <strong>${esc(profile.full_name || 'Optometrista')}</strong>
+            <small>${esc(profile.login_nick || 'login criado')} - clique para editar</small>
+          </div>
+          <i class="fas fa-chevron-right"></i>
+        </button>`).join('')}
+      </div>` : this.emptyState('fa-user-doctor', 'Nenhum optometrista cadastrado', 'Use o botao Optometrista para criar o login.')}
     </div>`;
 
     document.getElementById('content').innerHTML = html;
     document.getElementById('open-store-form').onclick = () => this.openStoreModal();
+    document.getElementById('open-optometrist-form').onclick = () => this.openOptometristModal();
     document.querySelectorAll('[data-store-id]').forEach(row => {
       row.addEventListener('click', () => this.openStoreModal(DB.getStore(row.dataset.storeId)));
+    });
+    document.querySelectorAll('[data-optometrist-id]').forEach(row => {
+      row.addEventListener('click', () => this.openOptometristModal(DB.getOptometrist(row.dataset.optometristId)));
     });
   },
 
   openAppointmentModal(defaults = {}) {
-    const allowedStores = DB.profile.role === 'admin'
+    const allowedStores = ['admin', 'optometrist'].includes(DB.profile.role)
       ? DB.stores
       : DB.stores.filter(store => store.id === DB.profile.store_id);
 
@@ -1034,8 +1282,12 @@ const App = {
     const apt = DB.appointments.find(row => row.id === id);
     if (!apt) return;
     const store = DB.getStore(apt.store_id);
+    const client = DB.getClient(apt.client_id)
+      || DB.clients.find(row => row.store_id === apt.store_id && row.phone === apt.client_phone)
+      || null;
     const canEdit = DB.canManageStore(apt.store_id);
     const times = getTimesForDate(parseLocalDate(apt.date));
+    const prescription = parsePrescription(client?.prescription);
 
     this.openModal(`<div class="modal-head">
       <h3>${canEdit ? 'Editar' : 'Visualizar'} agendamento</h3>
@@ -1062,6 +1314,7 @@ const App = {
       <label>Observacoes
         <textarea id="apt-notes" ${canEdit ? '' : 'disabled'}>${esc(apt.notes || '')}</textarea>
       </label>
+      ${this.renderPrescriptionGrid(prescription, !canEdit)}
       <div class="modal-foot appointment-actions">
         <button class="btn btn-whatsapp" type="button" id="whatsapp"><i class="fab fa-whatsapp"></i> WhatsApp</button>
         ${canEdit ? '<button class="btn btn-danger" type="button" id="delete-apt"><i class="fas fa-trash"></i> Excluir</button>' : ''}
@@ -1103,6 +1356,7 @@ const App = {
         client_name: document.getElementById('apt-client').value.trim(),
         client_phone: document.getElementById('apt-phone').value,
         notes: document.getElementById('apt-notes').value,
+        client_prescription: serializePrescription(this.readPrescriptionGrid()),
         status: apt.status || 'scheduled',
       };
       if (this.hasAppointmentConflict(payload, apt.id)) {
@@ -1129,8 +1383,9 @@ const App = {
   },
 
   openClientModal(client = null) {
-    const stores = DB.profile.role === 'admin' ? DB.stores : DB.stores.filter(s => s.id === DB.profile.store_id);
+    const stores = ['admin', 'optometrist'].includes(DB.profile.role) ? DB.stores : DB.stores.filter(s => s.id === DB.profile.store_id);
     const selectedStoreId = client?.store_id || stores[0]?.id;
+    const prescription = parsePrescription(client?.prescription);
 
     this.openModal(`<div class="modal-head">
       <h3>${client ? 'Editar cliente' : 'Novo cliente'}</h3>
@@ -1151,6 +1406,7 @@ const App = {
       <label>Observacoes
         <textarea id="client-notes">${esc(client?.notes || '')}</textarea>
       </label>
+      ${this.renderPrescriptionGrid(prescription)}
       <div class="modal-foot client-actions">
         <button class="btn btn-secondary modal-close" type="button">Cancelar</button>
         ${client ? '<button class="btn btn-danger" type="button" id="delete-client"><i class="fas fa-trash"></i> Excluir</button>' : ''}
@@ -1180,6 +1436,7 @@ const App = {
           phone: document.getElementById('client-phone').value,
           email: '',
           notes: document.getElementById('client-notes').value,
+          prescription: serializePrescription(this.readPrescriptionGrid()),
         });
         this.closeModal();
         this.render();
@@ -1188,6 +1445,142 @@ const App = {
         this.toast(err.message, 'error');
       }
     };
+  },
+
+  renderPrescriptionGrid(prescription, disabled = false) {
+    const columns = [
+      ['spherical', 'Esferico'],
+      ['cylindrical', 'Cilindrico'],
+      ['axis', 'Eixo'],
+      ['dnp', 'DNP'],
+      ['height', 'Altura'],
+    ];
+    const inputCell = (distance, eye, key) => `
+      <input
+        class="rx-input"
+        type="text"
+        inputmode="decimal"
+        autocomplete="off"
+        data-rx-distance="${distance}"
+        data-rx-eye="${eye}"
+        data-rx-field="${key}"
+        value="${esc(prescription?.[distance]?.[eye]?.[key] || '')}"
+        ${disabled ? 'disabled' : ''}
+      >
+    `;
+
+    return `<fieldset class="prescription-grid-field">
+      <legend>Receita do oculos</legend>
+      <div class="rx-prescription">
+        <div class="rx-header-row">
+          ${columns.map(([, label]) => `<div class="rx-head">${label}</div>`).join('')}
+        </div>
+        <div class="rx-body-grid">
+          <div class="rx-distance far">Longe</div>
+          <div class="rx-eye far">OD</div>
+          ${columns.map(([key]) => inputCell('far', 'od', key)).join('')}
+          <div class="rx-eye far">OE</div>
+          ${columns.map(([key]) => inputCell('far', 'oe', key)).join('')}
+          <div class="rx-distance near">Perto</div>
+          <div class="rx-eye near">OD</div>
+          ${columns.map(([key]) => inputCell('near', 'od', key)).join('')}
+          <div class="rx-eye near">OE</div>
+          ${columns.map(([key]) => inputCell('near', 'oe', key)).join('')}
+        </div>
+      </div>
+    </fieldset>`;
+  },
+
+  readPrescriptionGrid() {
+    const prescription = emptyPrescription();
+    document.querySelectorAll('[data-rx-distance][data-rx-eye][data-rx-field]').forEach(input => {
+      prescription[input.dataset.rxDistance][input.dataset.rxEye][input.dataset.rxField] = input.value.trim();
+    });
+    return prescription;
+  },
+
+  openOptometristModal(profile = null) {
+    const isEdit = Boolean(profile);
+    this.openModal(`<div class="modal-head">
+      <h3>${isEdit ? 'Editar optometrista' : 'Novo optometrista'}</h3>
+      <button class="modal-close">&times;</button>
+    </div>
+    <form class="modal-body form-stack" id="optometrist-form">
+      <label>Nome
+        <input type="text" id="optometrist-name" placeholder="Nome do optometrista" value="${esc(profile?.full_name || '')}" required>
+      </label>
+      <label>Nick/login
+        <input type="text" id="optometrist-nick" placeholder="optometrista-1" value="${esc(profile?.login_nick || '')}" required>
+      </label>
+      <label>Senha
+        <span class="password-row">
+          <input type="password" id="optometrist-password" minlength="6" placeholder="${isEdit ? 'Deixe em branco para manter' : 'Minimo 6 caracteres'}" ${isEdit ? '' : 'required'}>
+          <button class="btn-eye" type="button" data-toggle-password="optometrist-password" title="Mostrar senha"><i class="fas fa-eye"></i></button>
+        </span>
+      </label>
+      <div class="modal-foot">
+        <button class="btn btn-secondary modal-close" type="button">Cancelar</button>
+        <button class="btn btn-primary" type="submit">${isEdit ? 'Salvar login' : 'Criar login'}</button>
+      </div>
+    </form>`);
+
+    document.getElementById('optometrist-form').onsubmit = async event => {
+      event.preventDefault();
+      try {
+        const payload = {
+          name: document.getElementById('optometrist-name').value,
+          nick: document.getElementById('optometrist-nick').value,
+          password: document.getElementById('optometrist-password').value,
+        };
+        if (isEdit) await DB.updateOptometrist(profile.id, payload);
+        else await DB.createOptometrist(payload);
+        this.closeModal();
+        this.render();
+        this.toast(isEdit ? 'Optometrista atualizado' : 'Optometrista criado com login proprio', 'success');
+      } catch (err) {
+        this.toast(err.message, 'error');
+      }
+    };
+  },
+
+  openPrescriptionNotifications() {
+    if (DB.profile.role !== 'store') return;
+
+    const notifications = DB.prescriptionNotifications;
+    this.openModal(`<div class="modal-head">
+      <h3>Receitas recebidas</h3>
+      <button class="modal-close">&times;</button>
+    </div>
+    <div class="modal-body form-stack">
+      ${notifications.length ? `<div class="notification-list">
+        ${notifications.map(item => `<button class="notification-item ${item.read_at ? '' : 'unread'}" type="button" data-client-id="${item.client_id}">
+          <strong>${esc(item.client_name || 'Cliente')}</strong>
+          <span>${esc(item.message || 'Receita recebida')}</span>
+          <small>${this.fmtDateTime(item.created_at)}</small>
+        </button>`).join('')}
+      </div>` : this.emptyState('fa-bell', 'Nenhuma receita recebida', 'Quando uma receita for enviada para esta loja, ela aparece aqui.')}
+      <div class="modal-foot">
+        <button class="btn btn-secondary modal-close" type="button">Fechar</button>
+        ${notifications.some(item => !item.read_at) ? '<button class="btn btn-primary" type="button" id="mark-notifications-read">Marcar como lidas</button>' : ''}
+      </div>
+    </div>`);
+
+    document.querySelectorAll('.notification-item[data-client-id]').forEach(button => {
+      button.addEventListener('click', () => {
+        const client = DB.getClient(button.dataset.clientId);
+        if (client) this.openClientModal(client);
+      });
+    });
+
+    document.getElementById('mark-notifications-read')?.addEventListener('click', async () => {
+      try {
+        await DB.markPrescriptionNotificationsRead();
+        this.closeModal();
+        this.render();
+      } catch (err) {
+        this.toast(err.message, 'error');
+      }
+    });
   },
 
   openStoreModal(store = null) {
@@ -1296,12 +1689,32 @@ const App = {
     overlay.className = 'modal-overlay';
     overlay.id = 'modal';
     overlay.innerHTML = `<div class="modal-box">${html}</div>`;
+    if (overlay.querySelector('.rx-prescription')) {
+      overlay.querySelector('.modal-box').classList.add('prescription-modal');
+    }
     document.body.appendChild(overlay);
     overlay.addEventListener('click', event => {
       if (event.target === overlay) this.closeModal();
     });
     overlay.querySelectorAll('.modal-close').forEach(btn => btn.addEventListener('click', () => this.closeModal()));
     this.bindPasswordToggles(overlay);
+    this.bindPrescriptionInputs(overlay);
+  },
+
+  bindPrescriptionInputs(scope) {
+    scope.querySelectorAll('.rx-input').forEach(input => {
+      input.addEventListener('keydown', event => {
+        const key = event.key.toLowerCase();
+        if (key !== 'p' && key !== 'n') return;
+        event.preventDefault();
+        const sign = key === 'p' ? '+' : '-';
+        input.setRangeText(sign, input.selectionStart, input.selectionEnd, 'end');
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+      input.addEventListener('input', () => {
+        input.value = formatPrescriptionInput(input.value, input.dataset.rxField);
+      });
+    });
   },
 
   closeModal() {
@@ -1342,6 +1755,12 @@ const App = {
 
   fmtDateDisplay(d) {
     return `${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth() + 1).padStart(2, '0')}/${d.getFullYear()}`;
+  },
+
+  fmtDateTime(value) {
+    if (!value) return '';
+    const date = new Date(value);
+    return `${this.fmtDateDisplay(date)} ${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
   },
 
   fmtPhone(phone) {
@@ -1434,11 +1853,73 @@ function parseLocalDate(value) {
   return new Date(y, m - 1, d);
 }
 
+function emptyPrescription() {
+  const row = () => ({ spherical: '', cylindrical: '', axis: '', dnp: '', height: '' });
+  return {
+    far: { od: row(), oe: row() },
+    near: { od: row(), oe: row() },
+  };
+}
+
+function parsePrescription(value) {
+  const base = emptyPrescription();
+  if (!value) return base;
+
+  try {
+    const parsed = JSON.parse(value);
+    ['far', 'near'].forEach(distance => {
+      ['od', 'oe'].forEach(eye => {
+        Object.keys(base[distance][eye]).forEach(field => {
+          base[distance][eye][field] = parsed?.[distance]?.[eye]?.[field] || '';
+        });
+      });
+    });
+  } catch (_err) {
+    return base;
+  }
+
+  return base;
+}
+
+function isPrescriptionEmpty(prescription) {
+  return ['far', 'near'].every(distance => {
+    return ['od', 'oe'].every(eye => {
+      return Object.values(prescription[distance][eye]).every(value => !String(value || '').trim());
+    });
+  });
+}
+
+function serializePrescription(prescription) {
+  if (isPrescriptionEmpty(prescription)) return '';
+  return JSON.stringify(prescription);
+}
+
+function formatPrescriptionInput(value, field) {
+  const clean = String(value || '').replace(/[^0-9+\-.,/ ]/g, '');
+  if (!['spherical', 'cylindrical'].includes(field)) return clean;
+
+  const sign = clean.trim().startsWith('-') ? '-' : clean.trim().startsWith('+') ? '+' : '';
+  const digits = clean.replace(/\D/g, '');
+  if (digits.length <= 2) return `${sign}${digits}`;
+
+  const integer = String(Number(digits.slice(0, -2)));
+  const cents = digits.slice(-2);
+  return `${sign}${integer},${cents}`;
+}
+
 function isMissingRpcError(error) {
   const message = String(error?.message || '');
   return error?.code === 'PGRST202'
     || message.includes('Could not find the function public.admin_update_store')
     || message.includes('schema cache');
+}
+
+function isMissingTableError(error) {
+  const message = String(error?.message || '');
+  return error?.code === '42P01'
+    || error?.code === 'PGRST205'
+    || message.includes('Could not find the table')
+    || message.includes('relation "public.prescription_notifications" does not exist');
 }
 
 function labelStatus(value) {
