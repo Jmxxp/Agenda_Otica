@@ -932,7 +932,8 @@ const App = {
     const dateValue = isSunday(this.selDate) ? this.fmtDate(nextOpenDate(this.selDate)) : this.fmtDate(this.selDate);
     const initialTimes = getTimesForDate(parseLocalDate(dateValue));
     const time = defaults.time || initialTimes[0] || '08:00';
-    const hideSlotFields = DB.profile.role === 'store';
+    const openedFromScheduleCell = Boolean(defaults.store_id && defaults.time);
+    const hideSlotFields = DB.profile.role === 'store' || openedFromScheduleCell;
     const slotFields = hideSlotFields
       ? `<input type="hidden" id="apt-store" value="${esc(store.id)}">
         <input type="hidden" id="apt-date" value="${dateValue}">
