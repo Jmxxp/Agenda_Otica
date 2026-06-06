@@ -182,7 +182,7 @@ label { display: grid; gap: 7px; color: var(--text2); font-size: .82rem; font-we
   gap: 8px;
   padding: 5px;
   background: var(--bg3);
-  border-radius: var(--radius);
+  border-radius: 6px;
   margin-bottom: 18px;
 }
 
