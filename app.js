@@ -211,6 +211,8 @@ const DB = {
 
   handleRealtimePayload(table, payload) {
     if (this.profile?.role !== 'store') return;
+    const oldHasNewPrescription = Object.prototype.hasOwnProperty.call(payload.old || {}, 'new_prescription');
+    const oldHasNewPrescriptionUpdatedAt = Object.prototype.hasOwnProperty.call(payload.old || {}, 'new_prescription_updated_at');
 
     if (
       table === 'prescription_notifications'
@@ -225,8 +227,12 @@ const DB = {
       table === 'clients'
       && payload.eventType === 'UPDATE'
       && payload.new?.store_id === this.profile.store_id
-      && payload.new?.prescription
-      && payload.new?.prescription_updated_by !== this.user?.id
+      && payload.new?.new_prescription
+      && (
+        (oldHasNewPrescription && payload.new.new_prescription !== payload.old.new_prescription)
+        || (oldHasNewPrescriptionUpdatedAt && payload.new.new_prescription_updated_at !== payload.old.new_prescription_updated_at)
+      )
+      && payload.new?.new_prescription_updated_by !== this.user?.id
     ) {
       this.toastPrescriptionRealtime(payload.new.id);
     }
@@ -237,7 +243,7 @@ const DB = {
     const toastKey = `${key || 'receita'}:${Math.floor(now / 2500)}`;
     if (this.lastPrescriptionRealtimeToast === toastKey) return;
     this.lastPrescriptionRealtimeToast = toastKey;
-    App.toast('Nova receita recebida', 'info');
+    App.toast('Receita pronta para este cliente', 'info');
   },
 
   stopSync() {
@@ -514,9 +520,16 @@ const DB = {
 
   async saveClient(payload) {
     const current = payload.id ? this.getClient(payload.id) : null;
-    const nextPrescription = payload.prescription?.trim() || '';
+    const canSaveCurrentPrescription = ['admin', 'store'].includes(this.profile?.role);
+    const canSaveNewPrescription = this.profile?.role === 'optometrist';
+    const nextCurrentPrescription = payload.current_prescription?.trim() || payload.prescription?.trim() || '';
     const currentPrescription = current?.prescription?.trim() || '';
-    const prescriptionChanged = payload.prescription !== undefined && nextPrescription !== currentPrescription;
+    const currentPrescriptionChanged = (payload.current_prescription !== undefined || payload.prescription !== undefined)
+      && nextCurrentPrescription !== currentPrescription;
+    const nextNewPrescription = payload.new_prescription?.trim() || '';
+    const currentNewPrescription = current?.new_prescription?.trim() || '';
+    const newPrescriptionChanged = payload.new_prescription !== undefined
+      && nextNewPrescription !== currentNewPrescription;
     const clean = {
       store_id: payload.store_id,
       name: payload.name.trim(),
@@ -526,10 +539,16 @@ const DB = {
       created_by: this.user.id,
     };
 
-    if (payload.prescription !== undefined) {
-      clean.prescription = nextPrescription || null;
-      clean.prescription_updated_at = prescriptionChanged ? new Date().toISOString() : current?.prescription_updated_at || null;
-      clean.prescription_updated_by = prescriptionChanged ? this.user.id : current?.prescription_updated_by || null;
+    if ((payload.current_prescription !== undefined || payload.prescription !== undefined) && canSaveCurrentPrescription) {
+      clean.prescription = nextCurrentPrescription || null;
+      clean.prescription_updated_at = currentPrescriptionChanged ? new Date().toISOString() : current?.prescription_updated_at || null;
+      clean.prescription_updated_by = currentPrescriptionChanged ? this.user.id : current?.prescription_updated_by || null;
+    }
+
+    if (payload.new_prescription !== undefined && canSaveNewPrescription) {
+      clean.new_prescription = nextNewPrescription || null;
+      clean.new_prescription_updated_at = newPrescriptionChanged ? new Date().toISOString() : current?.new_prescription_updated_at || null;
+      clean.new_prescription_updated_by = newPrescriptionChanged ? this.user.id : current?.new_prescription_updated_by || null;
     }
 
     if (payload.id) {
@@ -540,7 +559,7 @@ const DB = {
         .select()
         .single();
       if (error) throw error;
-      await this.notifyPrescriptionChange(data, prescriptionChanged);
+      await this.notifyPrescriptionChange(data, newPrescriptionChanged);
       await this.refresh();
       return data;
     }
@@ -554,7 +573,7 @@ const DB = {
         .select()
         .single();
       if (error) throw error;
-      await this.notifyPrescriptionChange(data, prescriptionChanged);
+      await this.notifyPrescriptionChange(data, newPrescriptionChanged);
       await this.refresh();
       return data;
     }
@@ -565,13 +584,13 @@ const DB = {
       .select()
       .single();
     if (error) throw error;
-    await this.notifyPrescriptionChange(data, prescriptionChanged);
+    await this.notifyPrescriptionChange(data, newPrescriptionChanged);
     await this.refresh();
     return data;
   },
 
   async notifyPrescriptionChange(client, prescriptionChanged) {
-    if (!prescriptionChanged || !client?.prescription || this.profile?.role === 'store') return;
+    if (!prescriptionChanged || !client?.new_prescription || this.profile?.role !== 'optometrist') return;
 
     const store = this.getStore(client.store_id);
     const { error } = await this.client
@@ -580,7 +599,7 @@ const DB = {
         store_id: client.store_id,
         client_id: client.id,
         client_name: client.name,
-        message: `Receita de ${client.name} enviada para ${store?.name || 'loja'}.`,
+        message: `Nova receita de ${client.name} esta pronta para ${store?.name || 'loja'}.`,
         created_by: this.user.id,
       });
 
@@ -610,7 +629,8 @@ const DB = {
       name: payload.client_name,
       phone: payload.client_phone,
       notes: payload.client_notes,
-      prescription: payload.client_prescription,
+      current_prescription: payload.client_current_prescription,
+      new_prescription: payload.client_new_prescription,
     });
 
     const clean = {
@@ -1312,7 +1332,10 @@ const App = {
       || null;
     const canEdit = DB.canManageStore(apt.store_id);
     const times = getTimesForDate(parseLocalDate(apt.date));
-    const prescription = parsePrescription(client?.prescription);
+    const currentPrescription = parsePrescription(client?.prescription);
+    const newPrescription = parsePrescription(client?.new_prescription);
+    const canEditCurrentPrescription = canEdit && ['admin', 'store'].includes(DB.profile.role);
+    const canEditNewPrescription = canEdit && DB.profile.role === 'optometrist';
 
     this.openModal(`<div class="modal-head">
       <h3>${canEdit ? 'Editar' : 'Visualizar'} agendamento</h3>
@@ -1339,7 +1362,10 @@ const App = {
       <label>Observacoes
         <textarea id="apt-notes" ${canEdit ? '' : 'disabled'}>${esc(apt.notes || '')}</textarea>
       </label>
-      ${this.renderPrescriptionGrid(prescription, !canEdit)}
+      ${this.renderPrescriptionSection(currentPrescription, newPrescription, {
+        currentEditable: canEditCurrentPrescription,
+        newEditable: canEditNewPrescription,
+      })}
       <div class="modal-foot appointment-actions">
         <button class="btn btn-whatsapp" type="button" id="whatsapp"><i class="fab fa-whatsapp"></i> WhatsApp</button>
         ${canEdit ? '<button class="btn btn-danger" type="button" id="delete-apt"><i class="fas fa-trash"></i> Excluir</button>' : ''}
@@ -1381,7 +1407,8 @@ const App = {
         client_name: document.getElementById('apt-client').value.trim(),
         client_phone: document.getElementById('apt-phone').value,
         notes: document.getElementById('apt-notes').value,
-        client_prescription: serializePrescription(this.readPrescriptionGrid()),
+        client_current_prescription: canEditCurrentPrescription ? serializePrescription(this.readPrescriptionGrid('current')) : undefined,
+        client_new_prescription: canEditNewPrescription ? serializePrescription(this.readPrescriptionGrid('new')) : undefined,
         status: apt.status || 'scheduled',
       };
       if (this.hasAppointmentConflict(payload, apt.id)) {
@@ -1410,7 +1437,10 @@ const App = {
   openClientModal(client = null) {
     const stores = ['admin', 'optometrist'].includes(DB.profile.role) ? DB.stores : DB.stores.filter(s => s.id === DB.profile.store_id);
     const selectedStoreId = client?.store_id || stores[0]?.id;
-    const prescription = parsePrescription(client?.prescription);
+    const currentPrescription = parsePrescription(client?.prescription);
+    const newPrescription = parsePrescription(client?.new_prescription);
+    const canEditCurrentPrescription = ['admin', 'store'].includes(DB.profile.role);
+    const canEditNewPrescription = DB.profile.role === 'optometrist';
 
     this.openModal(`<div class="modal-head">
       <h3>${client ? 'Editar cliente' : 'Novo cliente'}</h3>
@@ -1431,7 +1461,10 @@ const App = {
       <label>Observacoes
         <textarea id="client-notes">${esc(client?.notes || '')}</textarea>
       </label>
-      ${this.renderPrescriptionGrid(prescription)}
+      ${this.renderPrescriptionSection(currentPrescription, newPrescription, {
+        currentEditable: canEditCurrentPrescription,
+        newEditable: canEditNewPrescription,
+      })}
       <div class="modal-foot client-actions">
         <button class="btn btn-secondary modal-close" type="button">Cancelar</button>
         ${client ? '<button class="btn btn-danger" type="button" id="delete-client"><i class="fas fa-trash"></i> Excluir</button>' : ''}
@@ -1461,7 +1494,8 @@ const App = {
           phone: document.getElementById('client-phone').value,
           email: '',
           notes: document.getElementById('client-notes').value,
-          prescription: serializePrescription(this.readPrescriptionGrid()),
+          current_prescription: canEditCurrentPrescription ? serializePrescription(this.readPrescriptionGrid('current')) : undefined,
+          new_prescription: canEditNewPrescription ? serializePrescription(this.readPrescriptionGrid('new')) : undefined,
         });
         this.closeModal();
         this.render();
@@ -1472,7 +1506,27 @@ const App = {
     };
   },
 
-  renderPrescriptionGrid(prescription, disabled = false) {
+  renderPrescriptionSection(currentPrescription, newPrescription, permissions = {}) {
+    const currentDisabled = !permissions.currentEditable;
+    const newDisabled = !permissions.newEditable;
+    const activeTab = permissions.newEditable && !permissions.currentEditable ? 'new' : 'current';
+
+    return `<fieldset class="prescription-grid-field">
+      <legend>Receita do oculos</legend>
+      <div class="rx-toggle" role="tablist">
+        <button class="rx-toggle-btn ${activeTab === 'current' ? 'active' : ''}" type="button" data-rx-tab="current">Receita atual</button>
+        <button class="rx-toggle-btn ${activeTab === 'new' ? 'active' : ''}" type="button" data-rx-tab="new">Nova receita</button>
+      </div>
+      <div class="rx-panel ${activeTab === 'current' ? 'active' : 'hidden'}" data-rx-panel="current">
+        ${this.renderPrescriptionGrid(currentPrescription, currentDisabled, 'current')}
+      </div>
+      <div class="rx-panel ${activeTab === 'new' ? 'active' : 'hidden'}" data-rx-panel="new">
+        ${this.renderPrescriptionGrid(newPrescription, newDisabled, 'new')}
+      </div>
+    </fieldset>`;
+  },
+
+  renderPrescriptionGrid(prescription, disabled = false, kind = 'current') {
     const columns = [
       ['spherical', 'Esferico'],
       ['cylindrical', 'Cilindrico'],
@@ -1486,6 +1540,7 @@ const App = {
         type="text"
         inputmode="decimal"
         autocomplete="off"
+        data-rx-kind="${kind}"
         data-rx-distance="${distance}"
         data-rx-eye="${eye}"
         data-rx-field="${key}"
@@ -1494,9 +1549,7 @@ const App = {
       >
     `;
 
-    return `<fieldset class="prescription-grid-field">
-      <legend>Receita do oculos</legend>
-      <div class="rx-prescription">
+    return `<div class="rx-prescription">
         <div class="rx-header-row">
           ${columns.map(([, label]) => `<div class="rx-head">${label}</div>`).join('')}
         </div>
@@ -1512,13 +1565,12 @@ const App = {
           <div class="rx-eye near">OE</div>
           ${columns.map(([key]) => inputCell('near', 'oe', key)).join('')}
         </div>
-      </div>
-    </fieldset>`;
+      </div>`;
   },
 
-  readPrescriptionGrid() {
+  readPrescriptionGrid(kind) {
     const prescription = emptyPrescription();
-    document.querySelectorAll('[data-rx-distance][data-rx-eye][data-rx-field]').forEach(input => {
+    document.querySelectorAll(`[data-rx-kind="${kind}"][data-rx-distance][data-rx-eye][data-rx-field]`).forEach(input => {
       prescription[input.dataset.rxDistance][input.dataset.rxEye][input.dataset.rxField] = input.value.trim();
     });
     return prescription;
@@ -1723,7 +1775,21 @@ const App = {
     });
     overlay.querySelectorAll('.modal-close').forEach(btn => btn.addEventListener('click', () => this.closeModal()));
     this.bindPasswordToggles(overlay);
+    this.bindPrescriptionTabs(overlay);
     this.bindPrescriptionInputs(overlay);
+  },
+
+  bindPrescriptionTabs(scope) {
+    scope.querySelectorAll('[data-rx-tab]').forEach(button => {
+      button.addEventListener('click', () => {
+        const tab = button.dataset.rxTab;
+        scope.querySelectorAll('[data-rx-tab]').forEach(item => item.classList.toggle('active', item === button));
+        scope.querySelectorAll('[data-rx-panel]').forEach(panel => {
+          panel.classList.toggle('hidden', panel.dataset.rxPanel !== tab);
+          panel.classList.toggle('active', panel.dataset.rxPanel === tab);
+        });
+      });
+    });
   },
 
   bindPrescriptionInputs(scope) {
