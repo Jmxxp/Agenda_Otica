@@ -21,6 +21,7 @@ const DB = {
   appointments: [],
   prescriptionNotifications: [],
   prescriptionNotificationsAvailable: true,
+  lastPrescriptionRealtimeToast: null,
   lastSync: null,
   timer: null,
   realtimeChannel: null,
@@ -185,14 +186,7 @@ const DB = {
         'postgres_changes',
         { event: '*', schema: 'public', table },
         payload => {
-          if (
-            table === 'prescription_notifications'
-            && payload.eventType === 'INSERT'
-            && this.profile?.role === 'store'
-            && payload.new?.store_id === this.profile.store_id
-          ) {
-            App.toast('Nova receita recebida', 'info');
-          }
+          this.handleRealtimePayload(table, payload);
           this.queueRealtimeRefresh();
         }
       );
@@ -213,6 +207,37 @@ const DB = {
         if (err) App.toast(`Realtime: ${err.message || status}`, 'error');
       }
     });
+  },
+
+  handleRealtimePayload(table, payload) {
+    if (this.profile?.role !== 'store') return;
+
+    if (
+      table === 'prescription_notifications'
+      && payload.eventType === 'INSERT'
+      && payload.new?.store_id === this.profile.store_id
+    ) {
+      this.toastPrescriptionRealtime(payload.new.client_id || payload.new.id);
+      return;
+    }
+
+    if (
+      table === 'clients'
+      && payload.eventType === 'UPDATE'
+      && payload.new?.store_id === this.profile.store_id
+      && payload.new?.prescription
+      && payload.new?.prescription_updated_by !== this.user?.id
+    ) {
+      this.toastPrescriptionRealtime(payload.new.id);
+    }
+  },
+
+  toastPrescriptionRealtime(key) {
+    const now = Date.now();
+    const toastKey = `${key || 'receita'}:${Math.floor(now / 2500)}`;
+    if (this.lastPrescriptionRealtimeToast === toastKey) return;
+    this.lastPrescriptionRealtimeToast = toastKey;
+    App.toast('Nova receita recebida', 'info');
   },
 
   stopSync() {
