@@ -1145,6 +1145,11 @@ label { display: grid; gap: 7px; color: var(--text2); font-size: .82rem; font-we
   border-radius: 7px;
 }
 
+.rx-delete-new-prescription {
+  width: fit-content;
+  margin-top: 10px;
+}
+
 .notification-list {
   display: grid;
   gap: 10px;

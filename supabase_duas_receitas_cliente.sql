@@ -231,8 +231,23 @@ begin
   end if;
 
   if tg_op = 'UPDATE' then
-    if new.new_prescription is distinct from old.new_prescription and v_role <> 'optometrist' then
-      raise exception 'Apenas optometrista pode alterar a nova receita';
+    if new.new_prescription is distinct from old.new_prescription then
+      if v_role = 'optometrist'
+        and coalesce(trim(old.new_prescription), '') <> ''
+        and coalesce(trim(new.new_prescription), '') = ''
+      then
+        raise exception 'Optometrista pode editar a nova receita, mas nao excluir';
+      end if;
+
+      if v_role = 'admin'
+        and coalesce(trim(new.new_prescription), '') <> ''
+      then
+        raise exception 'Admin apenas exclui a nova receita';
+      end if;
+
+      if v_role not in ('optometrist', 'admin') then
+        raise exception 'Apenas optometrista pode alterar a nova receita';
+      end if;
     end if;
 
     if new.prescription is distinct from old.prescription and v_role = 'optometrist' then
@@ -382,13 +397,13 @@ with check (
 );
 
 drop policy if exists "clients_delete_admin_optometrist_or_own_store" on public.clients;
-create policy "clients_delete_admin_optometrist_or_own_store"
+drop policy if exists "clients_delete_admin_only" on public.clients;
+create policy "clients_delete_admin_only"
 on public.clients
 for delete
 to authenticated
 using (
-  app_private.current_profile_role() in ('admin', 'optometrist')
-  or store_id = app_private.current_profile_store_id()
+  app_private.current_profile_role() = 'admin'
 );
 
 drop policy if exists "appointments_select_admin_optometrist_or_own_store" on public.appointments;

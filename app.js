@@ -544,6 +544,11 @@ const DB = {
     const currentNewPrescription = current?.new_prescription?.trim() || '';
     const newPrescriptionChanged = payload.new_prescription !== undefined
       && nextNewPrescription !== currentNewPrescription;
+
+    if (canSaveNewPrescription && payload.new_prescription !== undefined && currentNewPrescription && !nextNewPrescription) {
+      throw new Error('Optometrista pode editar a nova receita, mas nao excluir. Peça ao admin para excluir.');
+    }
+
     const clean = {
       store_id: payload.store_id,
       name: payload.name.trim(),
@@ -724,8 +729,8 @@ const DB = {
 
   async removeClient(id) {
     const client = this.getClient(id);
-    if (!client || !this.canManageStore(client.store_id)) {
-      throw new Error('Voce nao pode excluir este cliente');
+    if (!client || this.profile?.role !== 'admin') {
+      throw new Error('Apenas o admin pode excluir clientes');
     }
 
     const { data, error } = await this.client
@@ -739,6 +744,28 @@ const DB = {
     if (error) throw error;
     if (!data?.length) {
       throw new Error('Nao foi possivel excluir. Verifique as permissoes da tabela clients no Supabase.');
+    }
+    await this.refresh();
+  },
+
+  async removeNewPrescription(clientId) {
+    if (this.profile?.role !== 'admin') {
+      throw new Error('Apenas o admin pode excluir a nova receita');
+    }
+
+    const { data, error } = await this.client
+      .from('clients')
+      .update({
+        new_prescription: null,
+        new_prescription_updated_at: null,
+        new_prescription_updated_by: null,
+      })
+      .eq('id', clientId)
+      .select('id');
+
+    if (error) throw error;
+    if (!data?.length) {
+      throw new Error('Nao foi possivel excluir a nova receita. Verifique as permissoes da tabela clients no Supabase.');
     }
     await this.refresh();
   },
@@ -1506,6 +1533,7 @@ const App = {
     const newPrescription = parsePrescription(client?.new_prescription);
     const canEditCurrentPrescription = canEdit && ['admin', 'store'].includes(DB.profile.role);
     const canEditNewPrescription = canEdit && DB.profile.role === 'optometrist';
+    const canDeleteNewPrescription = Boolean(client?.id && client?.new_prescription && DB.profile.role === 'admin');
 
     this.openModal(`<div class="modal-head">
       <h3>${canEdit ? 'Editar' : 'Visualizar'} agendamento</h3>
@@ -1535,6 +1563,7 @@ const App = {
       ${this.renderPrescriptionSection(currentPrescription, newPrescription, {
         currentEditable: canEditCurrentPrescription,
         newEditable: canEditNewPrescription,
+        newDeletable: canDeleteNewPrescription,
         clientId: client?.id,
       })}
       <div class="modal-foot appointment-actions">
@@ -1612,6 +1641,8 @@ const App = {
     const newPrescription = parsePrescription(client?.new_prescription);
     const canEditCurrentPrescription = ['admin', 'store'].includes(DB.profile.role);
     const canEditNewPrescription = DB.profile.role === 'optometrist';
+    const canDeleteClient = Boolean(client && DB.profile.role === 'admin');
+    const canDeleteNewPrescription = Boolean(client?.id && client?.new_prescription && DB.profile.role === 'admin');
 
     this.openModal(`<div class="modal-head">
       <h3>${client ? 'Editar cliente' : 'Novo cliente'}</h3>
@@ -1635,12 +1666,13 @@ const App = {
       ${this.renderPrescriptionSection(currentPrescription, newPrescription, {
         currentEditable: canEditCurrentPrescription,
         newEditable: canEditNewPrescription,
+        newDeletable: canDeleteNewPrescription,
         activeTab: options.activePrescription,
         clientId: client?.id,
       })}
       <div class="modal-foot client-actions">
         <button class="btn btn-secondary modal-close" type="button">Cancelar</button>
-        ${client ? '<button class="btn btn-danger" type="button" id="delete-client"><i class="fas fa-trash"></i> Excluir</button>' : ''}
+        ${canDeleteClient ? '<button class="btn btn-danger" type="button" id="delete-client"><i class="fas fa-trash"></i> Excluir</button>' : ''}
         <button class="btn btn-primary" type="submit">Salvar</button>
       </div>
     </form>`);
@@ -1697,6 +1729,7 @@ const App = {
       </div>
       <div class="rx-panel ${activeTab === 'new' ? 'active' : 'hidden'}" data-rx-panel="new">
         ${this.renderPrescriptionGrid(newPrescription, newDisabled, 'new')}
+        ${permissions.newDeletable ? '<button class="btn btn-danger rx-delete-new-prescription" type="button" data-delete-new-prescription><i class="fas fa-trash"></i> Excluir nova receita</button>' : ''}
       </div>
     </fieldset>`;
   },
@@ -1970,8 +2003,27 @@ const App = {
     });
     overlay.querySelectorAll('.modal-close').forEach(btn => btn.addEventListener('click', () => this.closeModal()));
     this.bindPasswordToggles(overlay);
+    this.bindNewPrescriptionDelete(overlay);
     this.bindPrescriptionTabs(overlay);
     this.bindPrescriptionInputs(overlay);
+  },
+
+  bindNewPrescriptionDelete(scope) {
+    scope.querySelectorAll('[data-delete-new-prescription]').forEach(button => {
+      button.addEventListener('click', async () => {
+        const clientId = button.closest('[data-rx-client-id]')?.dataset.rxClientId;
+        if (!clientId) return;
+        if (!confirm('Excluir a nova receita deste cliente?')) return;
+        try {
+          await DB.removeNewPrescription(clientId);
+          this.closeModal();
+          this.render();
+          this.toast('Nova receita excluida', 'success');
+        } catch (err) {
+          this.toast(err.message, 'error');
+        }
+      });
+    });
   },
 
   bindPrescriptionTabs(scope) {
