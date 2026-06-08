@@ -9,6 +9,19 @@ const WEEKDAY_TIMES = [
   '14:00', '14:30', '15:00', '15:30', '16:00', '16:30',
   '17:00', '17:30', '18:00',
 ];
+const SOUND_PREF_KEY = 'otica_prescription_sound';
+const NOTIFICATION_SOUNDS = [
+  { id: 'rotating-bell', label: 'Sininho giratorio', src: 'assets/sounds/rotating-bicycle-bell.wav' },
+  { id: 'ding-dong', label: 'Ding dong', src: 'assets/sounds/ding-dong-bicycle-bell.ogg' },
+  { id: 'classic-bell', label: 'Sino classico', src: 'assets/sounds/classic-bicycle-bell.wav' },
+  { id: 'bike-bell', label: 'Campainha forte', src: 'assets/sounds/bike-bell.wav' },
+  { id: 'bicycle-1', label: 'Sininho 1', src: 'assets/sounds/bicycle-bell-1.wav' },
+  { id: 'bicycle-2', label: 'Sininho 2', src: 'assets/sounds/bicycle-bell-2.wav' },
+  { id: 'bicycle-3', label: 'Sininho 3', src: 'assets/sounds/bicycle-bell-3.wav' },
+  { id: 'marcolo', label: 'Tim curto', src: 'assets/sounds/marcolo-bicycle-bell.wav' },
+  { id: 'marcel', label: 'Tim longo', src: 'assets/sounds/marcel-bicycle-bell.wav' },
+  { id: 'bsu', label: 'Campainha limpa', src: 'assets/sounds/bsu-bike-bell.wav' },
+];
 
 const DB = {
   client: supabaseClient,
@@ -243,6 +256,7 @@ const DB = {
     const toastKey = `${key || 'receita'}:${Math.floor(now / 2500)}`;
     if (this.lastPrescriptionRealtimeToast === toastKey) return;
     this.lastPrescriptionRealtimeToast = toastKey;
+    App.playPrescriptionNotificationSound();
     App.renderPrescriptionRealtimeAlerts();
   },
 
@@ -636,6 +650,20 @@ const DB = {
     await this.refresh();
   },
 
+  async markPrescriptionNotificationsReadForClient(clientId) {
+    if (this.profile?.role !== 'store' || !this.profile.store_id || !clientId) return;
+
+    const { error } = await this.client
+      .from('prescription_notifications')
+      .update({ read_at: new Date().toISOString() })
+      .eq('client_id', clientId)
+      .eq('store_id', this.profile.store_id)
+      .is('read_at', null);
+
+    if (error) throw error;
+    await this.refresh();
+  },
+
   async saveAppointment(payload) {
     const client = await this.saveClient({
       id: payload.client_id,
@@ -724,6 +752,9 @@ const App = {
   today: new Date(),
   selDate: new Date(),
   calDate: new Date(),
+  audioContext: null,
+  audioUnlocked: false,
+  notificationSoundId: localStorage.getItem(SOUND_PREF_KEY) || 'bell',
 
   async boot() {
     this.bindAuth();
@@ -829,7 +860,10 @@ const App = {
   bindGlobal() {
     document.addEventListener('keydown', event => {
       if (event.key === 'Escape') this.closeModal();
+      if (!this.audioUnlocked) this.unlockNotificationAudio();
     });
+    document.addEventListener('pointerdown', () => this.unlockNotificationAudio(), { once: true });
+    document.addEventListener('touchstart', () => this.unlockNotificationAudio(), { once: true });
   },
 
   bindAppEvents() {
@@ -861,6 +895,7 @@ const App = {
     document.getElementById('btn-logout').onclick = () => this.logout();
     document.getElementById('btn-menu').onclick = () => document.getElementById('sidebar').classList.toggle('open');
     document.getElementById('btn-theme').onclick = () => this.toggleTheme();
+    document.getElementById('btn-settings').onclick = () => this.openSettingsModal();
     document.getElementById('btn-prescription-notifications').onclick = () => this.openPrescriptionNotifications();
 
     document.querySelectorAll('.nav-btn').forEach(btn => {
@@ -967,19 +1002,86 @@ const App = {
     });
   },
 
+  unlockNotificationAudio() {
+    if (this.audioUnlocked) return;
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx) return;
+    try {
+      this.audioContext = this.audioContext || new AudioCtx();
+      this.audioContext.resume?.();
+      this.audioUnlocked = true;
+    } catch (_err) {
+      this.audioUnlocked = false;
+    }
+  },
+
+  playPrescriptionNotificationSound() {
+    try {
+      const sound = this.getSelectedNotificationSound();
+      if (!sound?.src) return;
+      const audio = new Audio(sound.src);
+      audio.volume = 0.95;
+      audio.currentTime = 0;
+      audio.play().catch(() => {});
+    } catch (_err) {
+      // Som de notificacao e auxiliar; se o navegador bloquear, seguimos sem quebrar o app.
+    }
+  },
+
+  getSelectedNotificationSound() {
+    return NOTIFICATION_SOUNDS.find(sound => sound.id === this.notificationSoundId)
+      || NOTIFICATION_SOUNDS[0];
+  },
+
   async openPrescriptionNotification(notificationId) {
     const notification = DB.prescriptionNotifications.find(item => item.id === notificationId);
     if (!notification) return;
 
     const client = notification.client_id ? DB.getClient(notification.client_id) : null;
     try {
-      await DB.markPrescriptionNotificationRead(notification.id);
+      if (!notification.read_at) await DB.markPrescriptionNotificationRead(notification.id);
       this.render();
       if (client) this.openClientModal(client, { activePrescription: 'new' });
       else this.openPrescriptionNotifications();
     } catch (err) {
       this.toast(err.message, 'error');
     }
+  },
+
+  openSettingsModal() {
+    const currentSound = this.getSelectedNotificationSound();
+    this.openModal(`<div class="modal-head">
+      <h3>Configuracoes</h3>
+      <button class="modal-close">&times;</button>
+    </div>
+    <form class="modal-body form-stack" id="settings-form">
+      <label>Som da nova receita
+        <div class="settings-sound-row">
+          <select id="notification-sound">
+            ${NOTIFICATION_SOUNDS.map(sound => `<option value="${sound.id}" ${sound.id === currentSound.id ? 'selected' : ''}>${esc(sound.label)}</option>`).join('')}
+          </select>
+          <button class="btn btn-secondary" type="button" id="test-notification-sound"><i class="fas fa-volume-high"></i> Testar</button>
+        </div>
+      </label>
+      <div class="modal-foot">
+        <button class="btn btn-secondary modal-close" type="button">Cancelar</button>
+        <button class="btn btn-primary" type="submit">Salvar</button>
+      </div>
+    </form>`);
+
+    document.getElementById('test-notification-sound').addEventListener('click', () => {
+      this.notificationSoundId = document.getElementById('notification-sound').value;
+      this.unlockNotificationAudio();
+      this.playPrescriptionNotificationSound();
+    });
+
+    document.getElementById('settings-form').onsubmit = event => {
+      event.preventDefault();
+      this.notificationSoundId = document.getElementById('notification-sound').value;
+      localStorage.setItem(SOUND_PREF_KEY, this.notificationSoundId);
+      this.closeModal();
+      this.toast('Configuracoes salvas', 'success');
+    };
   },
 
   updateDateHeader() {
@@ -1081,11 +1183,11 @@ const App = {
         const canAdd = DB.canManageStore(store.id) && !apt;
         if (apt) {
           const hasNewPrescription = this.hasUnreadPrescriptionForAppointment(apt);
-          html += `<div class="grid-cell filled ${hasNewPrescription ? 'rx-ready-cell' : ''}" data-apt-id="${apt.id}">
+          html += `<div class="grid-cell filled" data-apt-id="${apt.id}">
             <div class="apt-card ${hasNewPrescription ? 'rx-ready-card' : ''}" style="--store:${store.color}; border-color:${store.color}">
               <div class="apt-name">${esc(apt.client_name)}</div>
               <div class="apt-phone">${this.fmtPhone(apt.client_phone)}</div>
-              ${hasNewPrescription ? '<div class="apt-rx-badge"><i class="fas fa-sparkles"></i> Nova receita</div>' : ''}
+              ${hasNewPrescription ? '<span class="apt-rx-dot" title="Nova receita"></span>' : ''}
             </div>
           </div>`;
         } else {
@@ -1138,7 +1240,7 @@ const App = {
             return `<button class="simp-apt ${hasNewPrescription ? 'rx-ready-card' : ''}" data-apt-id="${apt.id}" style="--store:${store?.color || '#64748b'}">
               <span class="simp-store"><span class="dot" style="background:${store?.color || '#64748b'}"></span>${esc(store?.name || 'Loja')}</span>
               <strong>${esc(apt.client_name)}</strong>
-              ${hasNewPrescription ? '<span class="apt-rx-badge"><i class="fas fa-sparkles"></i> Nova receita</span>' : ''}
+              ${hasNewPrescription ? '<span class="apt-rx-dot" title="Nova receita"></span>' : ''}
             </button>`;
           }).join('') : (canAdd ? '<button class="simp-add" type="button"><i class="fas fa-plus"></i></button>' : '')}
         </td>`;
@@ -1433,6 +1535,7 @@ const App = {
       ${this.renderPrescriptionSection(currentPrescription, newPrescription, {
         currentEditable: canEditCurrentPrescription,
         newEditable: canEditNewPrescription,
+        clientId: client?.id,
       })}
       <div class="modal-foot appointment-actions">
         <button class="btn btn-whatsapp" type="button" id="whatsapp"><i class="fab fa-whatsapp"></i> WhatsApp</button>
@@ -1533,6 +1636,7 @@ const App = {
         currentEditable: canEditCurrentPrescription,
         newEditable: canEditNewPrescription,
         activeTab: options.activePrescription,
+        clientId: client?.id,
       })}
       <div class="modal-foot client-actions">
         <button class="btn btn-secondary modal-close" type="button">Cancelar</button>
@@ -1580,10 +1684,11 @@ const App = {
     const newDisabled = !permissions.newEditable;
     const requestedTab = ['current', 'new'].includes(permissions.activeTab) ? permissions.activeTab : null;
     const activeTab = requestedTab || (permissions.newEditable && !permissions.currentEditable ? 'new' : 'current');
+    const clientAttr = permissions.clientId ? ` data-rx-client-id="${esc(permissions.clientId)}"` : '';
 
     return `<fieldset class="prescription-grid-field">
       <legend>Receita do oculos</legend>
-      <div class="rx-toggle" role="tablist" data-rx-active-tab="${activeTab}">
+      <div class="rx-toggle" role="tablist" data-rx-active-tab="${activeTab}"${clientAttr}>
         <button class="rx-toggle-btn ${activeTab === 'current' ? 'active' : ''}" type="button" data-rx-tab="current">Receita atual</button>
         <button class="rx-toggle-btn ${activeTab === 'new' ? 'active' : ''}" type="button" data-rx-tab="new">Nova receita</button>
       </div>
@@ -1871,16 +1976,33 @@ const App = {
 
   bindPrescriptionTabs(scope) {
     scope.querySelectorAll('[data-rx-tab]').forEach(button => {
-      button.addEventListener('click', () => {
+      button.addEventListener('click', async () => {
         const tab = button.dataset.rxTab;
-        button.closest('.rx-toggle')?.setAttribute('data-rx-active-tab', tab);
+        const toggle = button.closest('.rx-toggle');
+        toggle?.setAttribute('data-rx-active-tab', tab);
         scope.querySelectorAll('[data-rx-tab]').forEach(item => item.classList.toggle('active', item === button));
         scope.querySelectorAll('[data-rx-panel]').forEach(panel => {
           panel.classList.toggle('hidden', panel.dataset.rxPanel !== tab);
           panel.classList.toggle('active', panel.dataset.rxPanel === tab);
         });
+        if (tab === 'new' && toggle?.dataset.rxClientId) {
+          await this.markClientPrescriptionNotificationsRead(toggle.dataset.rxClientId);
+        }
       });
     });
+  },
+
+  async markClientPrescriptionNotificationsRead(clientId) {
+    if (DB.profile?.role !== 'store' || !clientId) return;
+    const hasUnread = DB.prescriptionNotifications.some(item => item.client_id === clientId && !item.read_at);
+    if (!hasUnread) return;
+
+    try {
+      await DB.markPrescriptionNotificationsReadForClient(clientId);
+      this.render();
+    } catch (err) {
+      this.toast(err.message, 'error');
+    }
   },
 
   bindPrescriptionInputs(scope) {
