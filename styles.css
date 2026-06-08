@@ -474,6 +474,14 @@ label { display: grid; gap: 7px; color: var(--text2); font-size: .82rem; font-we
   position: relative;
 }
 
+.notification-btn.has-unread {
+  color: #fff;
+  background: linear-gradient(135deg, #f59e0b, #ef4444 55%, #8b5cf6);
+  border-color: rgba(255,255,255,.45);
+  box-shadow: 0 0 0 4px rgba(245,158,11,.18), 0 0 28px rgba(245,158,11,.65);
+  animation: rxGlow 1.1s ease-in-out infinite;
+}
+
 .notification-count {
   position: absolute;
   top: -5px;
@@ -611,6 +619,13 @@ label { display: grid; gap: 7px; color: var(--text2); font-size: .82rem; font-we
   display: grid;
   place-items: stretch;
   background: var(--bg2);
+}
+
+.grid-cell.rx-ready-cell {
+  position: relative;
+  background: rgba(245,158,11,.14);
+  box-shadow: inset 0 0 0 2px rgba(245,158,11,.85);
+  animation: rxCellPulse 1.25s ease-in-out infinite;
 }
 
 .grid-cell.closed {
@@ -978,6 +993,17 @@ label { display: grid; gap: 7px; color: var(--text2); font-size: .82rem; font-we
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--bg3);
+  transition: border-color .18s, box-shadow .18s, background .18s;
+}
+
+.rx-toggle[data-rx-active-tab="current"] {
+  border-color: rgba(37,99,235,.48);
+  box-shadow: 0 0 0 3px rgba(37,99,235,.1);
+}
+
+.rx-toggle[data-rx-active-tab="new"] {
+  border-color: rgba(245,158,11,.62);
+  box-shadow: 0 0 0 3px rgba(245,158,11,.13);
 }
 
 .rx-toggle-btn {
@@ -987,11 +1013,19 @@ label { display: grid; gap: 7px; color: var(--text2); font-size: .82rem; font-we
   background: transparent;
   color: var(--text2);
   font-weight: 900;
+  transition: color .18s, background .18s, box-shadow .18s;
 }
 
-.rx-toggle-btn.active {
+.rx-toggle-btn[data-rx-tab="current"].active {
   background: var(--primary);
   color: #fff;
+  box-shadow: 0 6px 16px rgba(37,99,235,.28);
+}
+
+.rx-toggle-btn[data-rx-tab="new"].active {
+  background: linear-gradient(135deg, #f59e0b, #ef4444);
+  color: #fff;
+  box-shadow: 0 6px 16px rgba(245,158,11,.34);
 }
 
 .rx-panel {
@@ -1095,6 +1129,29 @@ label { display: grid; gap: 7px; color: var(--text2); font-size: .82rem; font-we
   box-shadow: inset 0 0 0 3px #2563eb;
 }
 
+.rx-addition-field {
+  display: grid;
+  grid-template-columns: minmax(96px, max-content) minmax(120px, 220px);
+  align-items: center;
+  gap: 12px;
+  width: fit-content;
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: var(--rx-line-w) solid var(--rx-line);
+  border-radius: 10px;
+  background: #fff;
+  color: #111827;
+  font-size: 1rem;
+  font-weight: 900;
+  text-transform: none;
+}
+
+.rx-addition-input {
+  min-height: 44px;
+  border: 2px solid #111827;
+  border-radius: 7px;
+}
+
 .notification-list {
   display: grid;
   gap: 10px;
@@ -1116,6 +1173,7 @@ label { display: grid; gap: 7px; color: var(--text2); font-size: .82rem; font-we
 .notification-item.unread {
   border-left-color: var(--red);
   background: rgba(37,99,235,.12);
+  box-shadow: 0 0 0 2px rgba(245,158,11,.2), 0 0 18px rgba(245,158,11,.28);
 }
 
 .notification-item span,
@@ -1254,6 +1312,76 @@ label { display: grid; gap: 7px; color: var(--text2); font-size: .82rem; font-we
 .toast.success { background: var(--green); }
 .toast.error { background: var(--red); }
 .toast.info { background: var(--primary); }
+
+.prescription-realtime-alert {
+  width: min(390px, calc(100vw - 36px));
+  font: inherit;
+  border: 1px solid rgba(255,255,255,.48);
+  background: linear-gradient(135deg, #f97316, #ef4444 52%, #7c3aed) !important;
+  cursor: pointer;
+  text-align: left;
+  box-shadow: 0 0 0 4px rgba(249,115,22,.18), 0 0 34px rgba(249,115,22,.75);
+  animation: rxGlow 1.05s ease-in-out infinite;
+}
+
+.prescription-realtime-alert i {
+  font-size: 1.15rem;
+}
+
+.prescription-realtime-alert span {
+  display: grid;
+  gap: 2px;
+}
+
+.prescription-realtime-alert small {
+  color: rgba(255,255,255,.88);
+  font-size: .78rem;
+}
+
+.rx-ready-card {
+  position: relative;
+  overflow: hidden;
+  box-shadow: 0 0 0 2px rgba(245,158,11,.92), 0 0 22px rgba(245,158,11,.52);
+  animation: rxCardPulse 1.25s ease-in-out infinite;
+}
+
+.apt-rx-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  width: fit-content;
+  margin-top: 4px;
+  padding: 3px 7px;
+  border-radius: 999px;
+  background: #f59e0b;
+  color: #111827;
+  font-size: .64rem;
+  font-weight: 900;
+  line-height: 1;
+  text-transform: uppercase;
+}
+
+@keyframes rxGlow {
+  50% {
+    filter: brightness(1.18);
+    transform: translateY(-1px);
+    box-shadow: 0 0 0 6px rgba(245,158,11,.12), 0 0 38px rgba(245,158,11,.85);
+  }
+}
+
+@keyframes rxCellPulse {
+  50% {
+    background: rgba(245,158,11,.26);
+    box-shadow: inset 0 0 0 3px rgba(245,158,11,1), 0 0 22px rgba(245,158,11,.55);
+  }
+}
+
+@keyframes rxCardPulse {
+  50% {
+    filter: brightness(1.12);
+    box-shadow: 0 0 0 3px rgba(245,158,11,1), 0 0 30px rgba(245,158,11,.74);
+  }
+}
 
 @media (max-width: 860px) {
   #app { grid-template-columns: 1fr; }
@@ -2519,6 +2647,10 @@ textarea {
   -webkit-text-fill-color: #111827;
 }
 
+.modal-box.prescription-modal .rx-addition-field {
+  margin-top: 12px;
+}
+
 @media (max-width: 760px) {
   .modal-box.prescription-modal {
     width: calc(100vw - 12px) !important;
@@ -2552,5 +2684,18 @@ textarea {
   .modal-box.prescription-modal .rx-distance,
   .modal-box.prescription-modal .rx-eye {
     font-size: .85rem;
+  }
+
+  .modal-box.prescription-modal .rx-addition-field {
+    grid-template-columns: 1fr;
+    width: 100%;
+    gap: 7px;
+    padding: 9px;
+    font-size: .85rem;
+  }
+
+  .modal-box.prescription-modal .rx-addition-input {
+    width: 100%;
+    min-height: 38px;
   }
 }

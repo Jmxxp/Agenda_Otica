@@ -243,7 +243,7 @@ const DB = {
     const toastKey = `${key || 'receita'}:${Math.floor(now / 2500)}`;
     if (this.lastPrescriptionRealtimeToast === toastKey) return;
     this.lastPrescriptionRealtimeToast = toastKey;
-    App.toast('Receita pronta para este cliente', 'info');
+    App.renderPrescriptionRealtimeAlerts();
   },
 
   stopSync() {
@@ -622,6 +622,20 @@ const DB = {
     await this.refresh();
   },
 
+  async markPrescriptionNotificationRead(id) {
+    if (this.profile?.role !== 'store' || !this.profile.store_id || !id) return;
+
+    const { error } = await this.client
+      .from('prescription_notifications')
+      .update({ read_at: new Date().toISOString() })
+      .eq('id', id)
+      .eq('store_id', this.profile.store_id)
+      .is('read_at', null);
+
+    if (error) throw error;
+    await this.refresh();
+  },
+
   async saveAppointment(payload) {
     const client = await this.saveClient({
       id: payload.client_id,
@@ -883,6 +897,7 @@ const App = {
     this.renderCalendar();
     this.updateConnStatus();
     this.updatePrescriptionNotifications();
+    this.renderPrescriptionRealtimeAlerts();
 
     if (this.activeView === 'clients') this.renderClients();
     else if (this.activeView === 'admin') this.renderAdmin();
@@ -914,8 +929,57 @@ const App = {
     const show = DB.profile?.role === 'store';
     const unread = DB.prescriptionNotifications.filter(item => !item.read_at).length;
     button.classList.toggle('hidden', !show);
+    button.classList.toggle('has-unread', show && Boolean(unread));
     count.textContent = String(unread);
     count.classList.toggle('hidden', !unread);
+  },
+
+  unreadPrescriptionNotifications() {
+    if (DB.profile?.role !== 'store') return [];
+    return DB.prescriptionNotifications.filter(item => !item.read_at);
+  },
+
+  unreadPrescriptionClientIds() {
+    return new Set(this.unreadPrescriptionNotifications().map(item => item.client_id).filter(Boolean));
+  },
+
+  hasUnreadPrescriptionForAppointment(apt) {
+    const unreadClientIds = this.unreadPrescriptionClientIds();
+    if (apt.client_id && unreadClientIds.has(apt.client_id)) return true;
+    const client = DB.clients.find(row => row.store_id === apt.store_id && row.phone === apt.client_phone);
+    return Boolean(client?.id && unreadClientIds.has(client.id));
+  },
+
+  renderPrescriptionRealtimeAlerts() {
+    const wrap = document.getElementById('toasts');
+    if (!wrap) return;
+    wrap.querySelectorAll('.prescription-realtime-alert').forEach(alert => alert.remove());
+
+    const unread = this.unreadPrescriptionNotifications();
+    unread.slice(0, 3).forEach(item => {
+      const button = document.createElement('button');
+      button.className = 'toast info prescription-realtime-alert';
+      button.type = 'button';
+      button.dataset.notificationId = item.id;
+      button.innerHTML = `<i class="fas fa-sparkles"></i><span><strong>Nova receita pronta</strong><small>${esc(item.client_name || 'Cliente')}</small></span>`;
+      button.addEventListener('click', () => this.openPrescriptionNotification(item.id));
+      wrap.prepend(button);
+    });
+  },
+
+  async openPrescriptionNotification(notificationId) {
+    const notification = DB.prescriptionNotifications.find(item => item.id === notificationId);
+    if (!notification) return;
+
+    const client = notification.client_id ? DB.getClient(notification.client_id) : null;
+    try {
+      await DB.markPrescriptionNotificationRead(notification.id);
+      this.render();
+      if (client) this.openClientModal(client, { activePrescription: 'new' });
+      else this.openPrescriptionNotifications();
+    } catch (err) {
+      this.toast(err.message, 'error');
+    }
   },
 
   updateDateHeader() {
@@ -1016,10 +1080,12 @@ const App = {
         const apt = appointments.find(a => a.store_id === store.id && normalizeTime(a.time) === time);
         const canAdd = DB.canManageStore(store.id) && !apt;
         if (apt) {
-          html += `<div class="grid-cell filled" data-apt-id="${apt.id}">
-            <div class="apt-card" style="--store:${store.color}; border-color:${store.color}">
+          const hasNewPrescription = this.hasUnreadPrescriptionForAppointment(apt);
+          html += `<div class="grid-cell filled ${hasNewPrescription ? 'rx-ready-cell' : ''}" data-apt-id="${apt.id}">
+            <div class="apt-card ${hasNewPrescription ? 'rx-ready-card' : ''}" style="--store:${store.color}; border-color:${store.color}">
               <div class="apt-name">${esc(apt.client_name)}</div>
               <div class="apt-phone">${this.fmtPhone(apt.client_phone)}</div>
+              ${hasNewPrescription ? '<div class="apt-rx-badge"><i class="fas fa-sparkles"></i> Nova receita</div>' : ''}
             </div>
           </div>`;
         } else {
@@ -1068,9 +1134,11 @@ const App = {
         html += `<td class="${atTime.length ? 'filled' : 'empty'}" data-time="${time}">
           ${atTime.length ? atTime.map(apt => {
             const store = DB.getStore(apt.store_id);
-            return `<button class="simp-apt" data-apt-id="${apt.id}" style="--store:${store?.color || '#64748b'}">
+            const hasNewPrescription = this.hasUnreadPrescriptionForAppointment(apt);
+            return `<button class="simp-apt ${hasNewPrescription ? 'rx-ready-card' : ''}" data-apt-id="${apt.id}" style="--store:${store?.color || '#64748b'}">
               <span class="simp-store"><span class="dot" style="background:${store?.color || '#64748b'}"></span>${esc(store?.name || 'Loja')}</span>
               <strong>${esc(apt.client_name)}</strong>
+              ${hasNewPrescription ? '<span class="apt-rx-badge"><i class="fas fa-sparkles"></i> Nova receita</span>' : ''}
             </button>`;
           }).join('') : (canAdd ? '<button class="simp-add" type="button"><i class="fas fa-plus"></i></button>' : '')}
         </td>`;
@@ -1434,7 +1502,7 @@ const App = {
     };
   },
 
-  openClientModal(client = null) {
+  openClientModal(client = null, options = {}) {
     const stores = ['admin', 'optometrist'].includes(DB.profile.role) ? DB.stores : DB.stores.filter(s => s.id === DB.profile.store_id);
     const selectedStoreId = client?.store_id || stores[0]?.id;
     const currentPrescription = parsePrescription(client?.prescription);
@@ -1464,6 +1532,7 @@ const App = {
       ${this.renderPrescriptionSection(currentPrescription, newPrescription, {
         currentEditable: canEditCurrentPrescription,
         newEditable: canEditNewPrescription,
+        activeTab: options.activePrescription,
       })}
       <div class="modal-foot client-actions">
         <button class="btn btn-secondary modal-close" type="button">Cancelar</button>
@@ -1509,11 +1578,12 @@ const App = {
   renderPrescriptionSection(currentPrescription, newPrescription, permissions = {}) {
     const currentDisabled = !permissions.currentEditable;
     const newDisabled = !permissions.newEditable;
-    const activeTab = permissions.newEditable && !permissions.currentEditable ? 'new' : 'current';
+    const requestedTab = ['current', 'new'].includes(permissions.activeTab) ? permissions.activeTab : null;
+    const activeTab = requestedTab || (permissions.newEditable && !permissions.currentEditable ? 'new' : 'current');
 
     return `<fieldset class="prescription-grid-field">
       <legend>Receita do oculos</legend>
-      <div class="rx-toggle" role="tablist">
+      <div class="rx-toggle" role="tablist" data-rx-active-tab="${activeTab}">
         <button class="rx-toggle-btn ${activeTab === 'current' ? 'active' : ''}" type="button" data-rx-tab="current">Receita atual</button>
         <button class="rx-toggle-btn ${activeTab === 'new' ? 'active' : ''}" type="button" data-rx-tab="new">Nova receita</button>
       </div>
@@ -1565,6 +1635,19 @@ const App = {
           <div class="rx-eye near">OE</div>
           ${columns.map(([key]) => inputCell('near', 'oe', key)).join('')}
         </div>
+        <label class="rx-addition-field">Adi&ccedil;&atilde;o
+          <input
+            class="rx-input rx-addition-input"
+            type="text"
+            inputmode="decimal"
+            autocomplete="off"
+            data-rx-kind="${kind}"
+            data-rx-addition="1"
+            data-rx-field="addition"
+            value="${esc(prescription?.addition || '')}"
+            ${disabled ? 'disabled' : ''}
+          >
+        </label>
       </div>`;
   },
 
@@ -1573,6 +1656,8 @@ const App = {
     document.querySelectorAll(`[data-rx-kind="${kind}"][data-rx-distance][data-rx-eye][data-rx-field]`).forEach(input => {
       prescription[input.dataset.rxDistance][input.dataset.rxEye][input.dataset.rxField] = input.value.trim();
     });
+    const addition = document.querySelector(`[data-rx-kind="${kind}"][data-rx-addition]`);
+    if (addition) prescription.addition = addition.value.trim();
     return prescription;
   },
 
@@ -1630,7 +1715,7 @@ const App = {
     </div>
     <div class="modal-body form-stack">
       ${notifications.length ? `<div class="notification-list">
-        ${notifications.map(item => `<button class="notification-item ${item.read_at ? '' : 'unread'}" type="button" data-client-id="${item.client_id}">
+        ${notifications.map(item => `<button class="notification-item ${item.read_at ? '' : 'unread'}" type="button" data-notification-id="${item.id}" data-client-id="${item.client_id}">
           <strong>${esc(item.client_name || 'Cliente')}</strong>
           <span>${esc(item.message || 'Receita recebida')}</span>
           <small>${this.fmtDateTime(item.created_at)}</small>
@@ -1643,7 +1728,12 @@ const App = {
     </div>`);
 
     document.querySelectorAll('.notification-item[data-client-id]').forEach(button => {
-      button.addEventListener('click', () => {
+      button.addEventListener('click', async () => {
+        const notificationId = button.dataset.notificationId;
+        if (notificationId) {
+          await this.openPrescriptionNotification(notificationId);
+          return;
+        }
         const client = DB.getClient(button.dataset.clientId);
         if (client) this.openClientModal(client);
       });
@@ -1783,6 +1873,7 @@ const App = {
     scope.querySelectorAll('[data-rx-tab]').forEach(button => {
       button.addEventListener('click', () => {
         const tab = button.dataset.rxTab;
+        button.closest('.rx-toggle')?.setAttribute('data-rx-active-tab', tab);
         scope.querySelectorAll('[data-rx-tab]').forEach(item => item.classList.toggle('active', item === button));
         scope.querySelectorAll('[data-rx-panel]').forEach(panel => {
           panel.classList.toggle('hidden', panel.dataset.rxPanel !== tab);
@@ -1947,6 +2038,7 @@ function parseLocalDate(value) {
 function emptyPrescription() {
   const row = () => ({ spherical: '', cylindrical: '', axis: '', dnp: '', height: '' });
   return {
+    addition: '',
     far: { od: row(), oe: row() },
     near: { od: row(), oe: row() },
   };
@@ -1958,6 +2050,7 @@ function parsePrescription(value) {
 
   try {
     const parsed = JSON.parse(value);
+    base.addition = parsed?.addition || parsed?.near?.od?.addition || parsed?.near?.oe?.addition || '';
     ['far', 'near'].forEach(distance => {
       ['od', 'oe'].forEach(eye => {
         Object.keys(base[distance][eye]).forEach(field => {
@@ -1973,7 +2066,7 @@ function parsePrescription(value) {
 }
 
 function isPrescriptionEmpty(prescription) {
-  return ['far', 'near'].every(distance => {
+  return !String(prescription?.addition || '').trim() && ['far', 'near'].every(distance => {
     return ['od', 'oe'].every(eye => {
       return Object.values(prescription[distance][eye]).every(value => !String(value || '').trim());
     });
@@ -1987,7 +2080,7 @@ function serializePrescription(prescription) {
 
 function formatPrescriptionInput(value, field) {
   const clean = String(value || '').replace(/[^0-9+\-.,/ ]/g, '');
-  if (!['spherical', 'cylindrical'].includes(field)) return clean;
+  if (!['spherical', 'cylindrical', 'addition'].includes(field)) return clean;
 
   const sign = clean.trim().startsWith('-') ? '-' : clean.trim().startsWith('+') ? '+' : '';
   const digits = clean.replace(/\D/g, '');
