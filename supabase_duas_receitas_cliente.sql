@@ -266,6 +266,7 @@ for each row
 execute function app_private.enforce_client_prescription_roles();
 
 alter table public.clients replica identity full;
+alter table public.appointments replica identity full;
 alter table public.prescription_notifications replica identity full;
 
 do $$
@@ -288,6 +289,16 @@ begin
       and tablename = 'clients'
   ) then
     alter publication supabase_realtime add table public.clients;
+  end if;
+
+  if not exists (
+    select 1
+    from pg_publication_tables
+    where pubname = 'supabase_realtime'
+      and schemaname = 'public'
+      and tablename = 'appointments'
+  ) then
+    alter publication supabase_realtime add table public.appointments;
   end if;
 end $$;
 

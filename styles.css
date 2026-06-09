@@ -1319,6 +1319,7 @@ label { display: grid; gap: 7px; color: var(--text2); font-size: .82rem; font-we
 .toast.success { background: var(--green); }
 .toast.error { background: var(--red); }
 .toast.info { background: var(--primary); }
+.toast.warning { background: #f97316; }
 
 .prescription-realtime-alert {
   margin-top: 74px;

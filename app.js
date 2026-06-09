@@ -35,6 +35,7 @@ const DB = {
   prescriptionNotifications: [],
   prescriptionNotificationsAvailable: true,
   lastPrescriptionRealtimeToast: null,
+  lastAppointmentCancelToast: null,
   lastSync: null,
   timer: null,
   realtimeChannel: null,
@@ -223,6 +224,10 @@ const DB = {
   },
 
   handleRealtimePayload(table, payload) {
+    if (table === 'appointments') {
+      this.handleAppointmentRealtime(payload);
+    }
+
     if (this.profile?.role !== 'store') return;
     const oldHasNewPrescription = Object.prototype.hasOwnProperty.call(payload.old || {}, 'new_prescription');
     const oldHasNewPrescriptionUpdatedAt = Object.prototype.hasOwnProperty.call(payload.old || {}, 'new_prescription_updated_at');
@@ -249,6 +254,28 @@ const DB = {
     ) {
       this.toastPrescriptionRealtime(payload.new.id);
     }
+  },
+
+  handleAppointmentRealtime(payload) {
+    const appointment = payload.new || payload.old;
+    if (!appointment?.store_id || !this.canSeeStoreRealtime(appointment.store_id)) return;
+
+    const becameCancelled = payload.eventType === 'UPDATE'
+      && payload.new?.status === 'cancelled'
+      && payload.old?.status !== 'cancelled';
+    const wasRemoved = payload.eventType === 'DELETE'
+      && payload.old?.status !== 'cancelled';
+    if (!becameCancelled && !wasRemoved) return;
+
+    const toastKey = `${payload.eventType}:${appointment.id || appointment.client_name}:${appointment.date}:${appointment.time}`;
+    if (this.lastAppointmentCancelToast === toastKey) return;
+    this.lastAppointmentCancelToast = toastKey;
+    App.toastAppointmentCancelled(appointment);
+  },
+
+  canSeeStoreRealtime(storeId) {
+    return ['admin', 'optometrist'].includes(this.profile?.role)
+      || this.profile?.store_id === storeId;
   },
 
   toastPrescriptionRealtime(key) {
@@ -948,6 +975,14 @@ const App = {
     });
   },
 
+  activateAgendaView(mode = 'grid') {
+    this.activeView = 'agenda';
+    this.scheduleMode = mode;
+    document.querySelectorAll('.nav-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.view === 'agenda'));
+    document.querySelectorAll('.view-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.mode === mode));
+    document.getElementById('sidebar')?.classList.remove('open');
+  },
+
   async logout() {
     await DB.signOut();
     this._appEventsBound = false;
@@ -1166,6 +1201,7 @@ const App = {
     container.querySelectorAll('[data-day]').forEach(day => {
       day.addEventListener('click', () => {
         this.selDate = new Date(y, m, Number(day.dataset.day));
+        this.activateAgendaView('grid');
         this.render();
       });
     });
@@ -2103,6 +2139,13 @@ const App = {
     el.innerHTML = `<i class="fas fa-${icon}"></i>${esc(message)}`;
     wrap.appendChild(el);
     setTimeout(() => el.remove(), 3500);
+  },
+
+  toastAppointmentCancelled(appointment) {
+    const date = appointment.date ? this.fmtDateDisplay(parseLocalDate(appointment.date)) : '';
+    const time = appointment.time ? normalizeTime(appointment.time) : '';
+    const name = appointment.client_name || 'Cliente';
+    this.toast(`Agendamento cancelado: ${name}${date ? ` - ${date}` : ''}${time ? ` as ${time}` : ''}`, 'warning');
   },
 
   fmtDate(d) {
