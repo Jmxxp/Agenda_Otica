@@ -1174,6 +1174,15 @@ label { display: grid; gap: 7px; color: var(--text2); font-size: .82rem; font-we
   box-shadow: 0 0 0 2px rgba(245,158,11,.2), 0 0 18px rgba(245,158,11,.28);
 }
 
+.notification-item.cancelled {
+  border-left-color: #f97316;
+}
+
+.notification-item.cancelled.unread {
+  background: rgba(249,115,22,.12);
+  box-shadow: 0 0 0 2px rgba(249,115,22,.16), 0 0 18px rgba(249,115,22,.22);
+}
+
 .notification-item span,
 .notification-item small {
   color: var(--text2);

@@ -10,6 +10,7 @@ const WEEKDAY_TIMES = [
   '17:00', '17:30', '18:00',
 ];
 const SOUND_PREF_KEY = 'otica_prescription_sound';
+const LOCAL_APPOINTMENT_NOTIFICATIONS_KEY = 'otica_appointment_notifications';
 const NOTIFICATION_SOUNDS = [
   { id: 'rotating-bell', label: 'Sininho giratorio', src: 'assets/sounds/rotating-bicycle-bell.wav' },
   { id: 'ding-dong', label: 'Ding dong', src: 'assets/sounds/ding-dong-bicycle-bell.ogg' },
@@ -33,7 +34,9 @@ const DB = {
   clients: [],
   appointments: [],
   prescriptionNotifications: [],
+  appointmentNotifications: [],
   prescriptionNotificationsAvailable: true,
+  appointmentNotificationsAvailable: true,
   lastPrescriptionRealtimeToast: null,
   lastAppointmentCancelToast: null,
   lastSync: null,
@@ -119,6 +122,7 @@ const DB = {
     this.clients = [];
     this.appointments = [];
     this.prescriptionNotifications = [];
+    this.appointmentNotifications = [];
     if (this.client) await this.client.auth.signOut();
   },
 
@@ -141,6 +145,7 @@ const DB = {
     this.appointments = appointmentsRes.data || [];
     this.clients = clientsRes.data || [];
     this.prescriptionNotifications = await this.loadPrescriptionNotifications();
+    this.appointmentNotifications = await this.loadAppointmentNotifications();
     this.lastSync = new Date();
     return true;
   },
@@ -174,6 +179,85 @@ const DB = {
     return data || [];
   },
 
+  async loadAppointmentNotifications() {
+    if (this.profile?.role !== 'store' || !this.profile.store_id) return [];
+    const { data, error } = await this.client
+      .from('appointment_notifications')
+      .select('*')
+      .eq('store_id', this.profile.store_id)
+      .order('created_at', { ascending: false })
+      .limit(30);
+
+    if (isMissingTableError(error)) {
+      this.appointmentNotificationsAvailable = false;
+      return this.loadLocalAppointmentNotifications();
+    }
+    if (error) throw error;
+    this.appointmentNotificationsAvailable = true;
+    return this.mergeAppointmentNotifications(data || [], this.loadLocalAppointmentNotifications());
+  },
+
+  loadLocalAppointmentNotifications() {
+    if (this.profile?.role !== 'store' || !this.profile.store_id) return [];
+    try {
+      return this.loadAllLocalAppointmentNotifications()
+        .filter(item => item.store_id === this.profile.store_id);
+    } catch (_err) {
+      return [];
+    }
+  },
+
+  loadAllLocalAppointmentNotifications() {
+    try {
+      return JSON.parse(localStorage.getItem(LOCAL_APPOINTMENT_NOTIFICATIONS_KEY) || '[]');
+    } catch (_err) {
+      return [];
+    }
+  },
+
+  saveLocalAppointmentNotifications(items) {
+    localStorage.setItem(LOCAL_APPOINTMENT_NOTIFICATIONS_KEY, JSON.stringify(items.slice(0, 100)));
+  },
+
+  addLocalAppointmentNotification(notification) {
+    const allItems = this.loadAllLocalAppointmentNotifications();
+    if (allItems.some(item => item.local_id === notification.local_id)) return;
+    this.saveLocalAppointmentNotifications([notification, ...allItems]);
+    this.appointmentNotifications = this.mergeAppointmentNotifications(this.appointmentNotifications, [notification])
+      .sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0))
+      .slice(0, 30);
+  },
+
+  mergeAppointmentNotifications(primary, fallback) {
+    const seen = new Set();
+    return [...primary, ...fallback].filter(item => {
+      const key = this.appointmentNotificationKey(item);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    }).sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0)).slice(0, 30);
+  },
+
+  appointmentNotificationKey(item) {
+    return `${item.appointment_id || item.local_id || ''}:${item.client_name || ''}:${item.appointment_date || ''}:${item.appointment_time || ''}`;
+  },
+
+  buildAppointmentNotification(appointment) {
+    return {
+      local_id: `local-cancel:${appointment.id || appointment.client_name}:${appointment.date}:${appointment.time}`,
+      store_id: appointment.store_id,
+      appointment_id: appointment.id || null,
+      client_id: appointment.client_id || null,
+      client_name: appointment.client_name || 'Cliente',
+      appointment_date: appointment.date || null,
+      appointment_time: appointment.time ? normalizeTime(appointment.time) : null,
+      message: `Agendamento cancelado: ${appointment.client_name || 'Cliente'}`,
+      read_at: null,
+      created_by: this.user?.id || null,
+      created_at: new Date().toISOString(),
+    };
+  },
+
   async startSync() {
     this.stopSync();
     if (!this.client) return;
@@ -194,6 +278,7 @@ const DB = {
 
     const tables = ['stores', 'profiles', 'clients', 'appointments'];
     if (this.prescriptionNotificationsAvailable) tables.push('prescription_notifications');
+    if (this.appointmentNotificationsAvailable) tables.push('appointment_notifications');
     let channel = this.client.channel(`agenda-realtime-${this.user?.id || Date.now()}`);
     tables.forEach(table => {
       channel = channel.on(
@@ -242,6 +327,15 @@ const DB = {
     }
 
     if (
+      table === 'appointment_notifications'
+      && payload.eventType === 'INSERT'
+      && payload.new?.store_id === this.profile.store_id
+    ) {
+      this.toastAppointmentCancelledRealtime(payload.new);
+      return;
+    }
+
+    if (
       table === 'clients'
       && payload.eventType === 'UPDATE'
       && payload.new?.store_id === this.profile.store_id
@@ -257,17 +351,32 @@ const DB = {
   },
 
   handleAppointmentRealtime(payload) {
-    const appointment = payload.new || payload.old;
+    const eventType = payload.eventType;
+    const incoming = eventType === 'DELETE' ? payload.old || {} : payload.new || {};
+    const local = incoming.id ? this.appointments.find(appointment => appointment.id === incoming.id) : null;
+    const appointment = { ...(local || {}), ...incoming };
     if (!appointment?.store_id || !this.canSeeStoreRealtime(appointment.store_id)) return;
 
-    const becameCancelled = payload.eventType === 'UPDATE'
+    const previousStatus = payload.old?.status || local?.status;
+    const becameCancelled = eventType === 'UPDATE'
       && payload.new?.status === 'cancelled'
-      && payload.old?.status !== 'cancelled';
-    const wasRemoved = payload.eventType === 'DELETE'
-      && payload.old?.status !== 'cancelled';
+      && previousStatus !== 'cancelled';
+    const wasRemoved = eventType === 'DELETE'
+      && previousStatus !== 'cancelled';
     if (!becameCancelled && !wasRemoved) return;
 
-    const toastKey = `${payload.eventType}:${appointment.id || appointment.client_name}:${appointment.date}:${appointment.time}`;
+    const toastKey = `${eventType}:${appointment.id || appointment.client_name}:${appointment.date}:${appointment.time}`;
+    if (this.lastAppointmentCancelToast === toastKey) return;
+    this.lastAppointmentCancelToast = toastKey;
+    if (this.profile?.role === 'store') {
+      this.addLocalAppointmentNotification(this.buildAppointmentNotification(appointment));
+      App.updatePrescriptionNotifications();
+    }
+    App.toastAppointmentCancelled(appointment);
+  },
+
+  toastAppointmentCancelledRealtime(appointment) {
+    const toastKey = `cancel-history:${appointment.appointment_id || appointment.id || appointment.client_name}:${appointment.appointment_date || appointment.date}:${appointment.appointment_time || appointment.time}`;
     if (this.lastAppointmentCancelToast === toastKey) return;
     this.lastAppointmentCancelToast = toastKey;
     App.toastAppointmentCancelled(appointment);
@@ -655,6 +764,22 @@ const DB = {
     if (error) throw error;
   },
 
+  async notifyAppointmentCancelled(appointment) {
+    if (!appointment?.store_id) return;
+    const notification = this.buildAppointmentNotification(appointment);
+    if (this.profile?.role === 'store') this.addLocalAppointmentNotification(notification);
+
+    const { error } = await this.client
+      .from('appointment_notifications')
+      .insert(notification);
+
+    if (isMissingTableError(error)) {
+      this.appointmentNotificationsAvailable = false;
+      return;
+    }
+    if (error) throw error;
+  },
+
   async markPrescriptionNotificationsRead() {
     if (this.profile?.role !== 'store' || !this.profile.store_id) return;
 
@@ -693,6 +818,79 @@ const DB = {
       .is('read_at', null);
 
     if (error) throw error;
+    await this.refresh();
+  },
+
+  async markAppointmentNotificationsRead() {
+    if (this.profile?.role !== 'store' || !this.profile.store_id) return;
+    this.markLocalAppointmentNotificationsRead();
+
+    const { error } = await this.client
+      .from('appointment_notifications')
+      .update({ read_at: new Date().toISOString() })
+      .eq('store_id', this.profile.store_id)
+      .is('read_at', null);
+
+    if (isMissingTableError(error)) {
+      this.appointmentNotificationsAvailable = false;
+      return;
+    }
+    if (error) throw error;
+    await this.refresh();
+  },
+
+  async markAppointmentNotificationRead(id) {
+    if (this.profile?.role !== 'store' || !this.profile.store_id || !id) return;
+    if (String(id).startsWith('local-')) {
+      this.markLocalAppointmentNotificationsRead(id);
+      await this.refresh();
+      return;
+    }
+
+    const { error } = await this.client
+      .from('appointment_notifications')
+      .update({ read_at: new Date().toISOString() })
+      .eq('id', id)
+      .eq('store_id', this.profile.store_id)
+      .is('read_at', null);
+
+    if (isMissingTableError(error)) {
+      this.appointmentNotificationsAvailable = false;
+      return;
+    }
+    if (error) throw error;
+    await this.refresh();
+  },
+
+  markLocalAppointmentNotificationsRead(id = null) {
+    const now = new Date().toISOString();
+    const items = this.loadAllLocalAppointmentNotifications().map(item => {
+      if (item.store_id !== this.profile.store_id) return item;
+      if (id && item.local_id !== id) return item;
+      return { ...item, read_at: item.read_at || now };
+    });
+    this.saveLocalAppointmentNotifications(items);
+  },
+
+  async clearAllNotifications() {
+    if (this.profile?.role !== 'store' || !this.profile.store_id) return;
+
+    const prescriptionDelete = this.client
+      .from('prescription_notifications')
+      .delete()
+      .eq('store_id', this.profile.store_id);
+    const appointmentDelete = this.client
+      .from('appointment_notifications')
+      .delete()
+      .eq('store_id', this.profile.store_id);
+
+    const [prescriptionRes, appointmentRes] = await Promise.all([prescriptionDelete, appointmentDelete]);
+    if (prescriptionRes.error && !isMissingTableError(prescriptionRes.error)) throw prescriptionRes.error;
+    if (appointmentRes.error && !isMissingTableError(appointmentRes.error)) throw appointmentRes.error;
+
+    const localItems = this.loadAllLocalAppointmentNotifications()
+      .filter(item => item.store_id !== this.profile.store_id);
+    this.saveLocalAppointmentNotifications(localItems);
     await this.refresh();
   },
 
@@ -742,6 +940,7 @@ const DB = {
   },
 
   async removeAppointment(id) {
+    const appointment = this.appointments.find(row => row.id === id);
     const { data, error } = await this.client
       .from('appointments')
       .delete()
@@ -751,7 +950,10 @@ const DB = {
     if (!data?.length) {
       throw new Error('Nao foi possivel excluir. Verifique as permissoes da tabela appointments no Supabase.');
     }
+    if (appointment) await this.notifyAppointmentCancelled(appointment);
     await this.refresh();
+    App.updatePrescriptionNotifications?.();
+    if (appointment) App.toastAppointmentCancelled(appointment);
   },
 
   async removeClient(id) {
@@ -1024,7 +1226,8 @@ const App = {
     if (!button || !count) return;
 
     const show = DB.profile?.role === 'store';
-    const unread = DB.prescriptionNotifications.filter(item => !item.read_at).length;
+    const unread = DB.prescriptionNotifications.filter(item => !item.read_at).length
+      + DB.appointmentNotifications.filter(item => !item.read_at).length;
     button.classList.toggle('hidden', !show);
     button.classList.toggle('has-unread', show && Boolean(unread));
     count.textContent = String(unread);
@@ -1626,7 +1829,6 @@ const App = {
         await DB.removeAppointment(apt.id);
         this.closeModal();
         this.render();
-        this.toast('Agendamento excluido', 'success');
       } catch (err) {
         this.toast(err.message, 'error');
       }
@@ -1882,27 +2084,37 @@ const App = {
   openPrescriptionNotifications() {
     if (DB.profile.role !== 'store') return;
 
-    const notifications = DB.prescriptionNotifications;
+    const notifications = [
+      ...DB.prescriptionNotifications.map(item => ({ ...item, kind: 'prescription' })),
+      ...DB.appointmentNotifications.map(item => ({ ...item, kind: 'appointment' })),
+    ].sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
     this.openModal(`<div class="modal-head">
-      <h3>Receitas recebidas</h3>
+      <h3>Notificacoes</h3>
       <button class="modal-close">&times;</button>
     </div>
     <div class="modal-body form-stack">
       ${notifications.length ? `<div class="notification-list">
-        ${notifications.map(item => `<button class="notification-item ${item.read_at ? '' : 'unread'}" type="button" data-notification-id="${item.id}" data-client-id="${item.client_id}">
-          <strong>${esc(item.client_name || 'Cliente')}</strong>
+        ${notifications.map(item => `<button class="notification-item ${item.read_at ? '' : 'unread'} ${item.kind === 'appointment' ? 'cancelled' : ''}" type="button" data-kind="${item.kind}" data-notification-id="${item.id || item.local_id || ''}" data-client-id="${item.client_id || ''}">
+          <strong>${item.kind === 'appointment' ? 'Agendamento cancelado' : esc(item.client_name || 'Cliente')}</strong>
           <span>${esc(item.message || 'Receita recebida')}</span>
           <small>${this.fmtDateTime(item.created_at)}</small>
         </button>`).join('')}
-      </div>` : this.emptyState('fa-bell', 'Nenhuma receita recebida', 'Quando uma receita for enviada para esta loja, ela aparece aqui.')}
+      </div>` : this.emptyState('fa-bell', 'Nenhuma notificacao', 'Receitas prontas e cancelamentos aparecem aqui.')}
       <div class="modal-foot">
         <button class="btn btn-secondary modal-close" type="button">Fechar</button>
         ${notifications.some(item => !item.read_at) ? '<button class="btn btn-primary" type="button" id="mark-notifications-read">Marcar como lidas</button>' : ''}
+        ${notifications.length ? '<button class="btn btn-danger" type="button" id="clear-notifications"><i class="fas fa-trash"></i> Limpar notificacoes</button>' : ''}
       </div>
     </div>`);
 
     document.querySelectorAll('.notification-item[data-client-id]').forEach(button => {
       button.addEventListener('click', async () => {
+        if (button.dataset.kind === 'appointment') {
+          await DB.markAppointmentNotificationRead(button.dataset.notificationId);
+          this.closeModal();
+          this.render();
+          return;
+        }
         const notificationId = button.dataset.notificationId;
         if (notificationId) {
           await this.openPrescriptionNotification(notificationId);
@@ -1916,8 +2128,21 @@ const App = {
     document.getElementById('mark-notifications-read')?.addEventListener('click', async () => {
       try {
         await DB.markPrescriptionNotificationsRead();
+        await DB.markAppointmentNotificationsRead();
         this.closeModal();
         this.render();
+      } catch (err) {
+        this.toast(err.message, 'error');
+      }
+    });
+
+    document.getElementById('clear-notifications')?.addEventListener('click', async () => {
+      if (!confirm('Limpar todo o historico de notificacoes?')) return;
+      try {
+        await DB.clearAllNotifications();
+        this.closeModal();
+        this.render();
+        this.toast('Notificacoes limpas', 'success');
       } catch (err) {
         this.toast(err.message, 'error');
       }
@@ -2142,8 +2367,10 @@ const App = {
   },
 
   toastAppointmentCancelled(appointment) {
-    const date = appointment.date ? this.fmtDateDisplay(parseLocalDate(appointment.date)) : '';
-    const time = appointment.time ? normalizeTime(appointment.time) : '';
+    const rawDate = appointment.date || appointment.appointment_date;
+    const rawTime = appointment.time || appointment.appointment_time;
+    const date = rawDate ? this.fmtDateDisplay(parseLocalDate(rawDate)) : '';
+    const time = rawTime ? normalizeTime(rawTime) : '';
     const name = appointment.client_name || 'Cliente';
     this.toast(`Agendamento cancelado: ${name}${date ? ` - ${date}` : ''}${time ? ` as ${time}` : ''}`, 'warning');
   },

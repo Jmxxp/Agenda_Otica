@@ -198,16 +198,32 @@ create table if not exists public.prescription_notifications (
   created_at timestamptz not null default now()
 );
 
+create table if not exists public.appointment_notifications (
+  id uuid primary key default gen_random_uuid(),
+  store_id uuid not null references public.stores(id) on delete cascade,
+  appointment_id uuid,
+  client_id uuid references public.clients(id) on delete set null,
+  client_name text,
+  appointment_date date,
+  appointment_time time,
+  message text not null,
+  read_at timestamptz,
+  created_by uuid references auth.users(id),
+  created_at timestamptz not null default now()
+);
+
 alter table public.profiles enable row level security;
 alter table public.stores enable row level security;
 alter table public.clients enable row level security;
 alter table public.appointments enable row level security;
 alter table public.prescription_notifications enable row level security;
+alter table public.appointment_notifications enable row level security;
 grant select, insert, update on table public.profiles to authenticated;
 grant select, insert, update, delete on table public.stores to authenticated;
 grant select, insert, update, delete on table public.clients to authenticated;
 grant select, insert, update, delete on table public.appointments to authenticated;
-grant select, insert, update on table public.prescription_notifications to authenticated;
+grant select, insert, update, delete on table public.prescription_notifications to authenticated;
+grant select, insert, update, delete on table public.appointment_notifications to authenticated;
 
 create or replace function app_private.enforce_client_prescription_roles()
 returns trigger
@@ -268,6 +284,7 @@ execute function app_private.enforce_client_prescription_roles();
 alter table public.clients replica identity full;
 alter table public.appointments replica identity full;
 alter table public.prescription_notifications replica identity full;
+alter table public.appointment_notifications replica identity full;
 
 do $$
 begin
@@ -299,6 +316,16 @@ begin
       and tablename = 'appointments'
   ) then
     alter publication supabase_realtime add table public.appointments;
+  end if;
+
+  if not exists (
+    select 1
+    from pg_publication_tables
+    where pubname = 'supabase_realtime'
+      and schemaname = 'public'
+      and tablename = 'appointment_notifications'
+  ) then
+    alter publication supabase_realtime add table public.appointment_notifications;
   end if;
 end $$;
 
@@ -491,6 +518,60 @@ using (
   and store_id = app_private.current_profile_store_id()
 )
 with check (
+  app_private.current_profile_role() = 'store'
+  and store_id = app_private.current_profile_store_id()
+);
+
+drop policy if exists "prescription_notifications_store_delete_own" on public.prescription_notifications;
+create policy "prescription_notifications_store_delete_own"
+on public.prescription_notifications
+for delete
+to authenticated
+using (
+  app_private.current_profile_role() = 'store'
+  and store_id = app_private.current_profile_store_id()
+);
+
+drop policy if exists "appointment_notifications_store_select_own" on public.appointment_notifications;
+create policy "appointment_notifications_store_select_own"
+on public.appointment_notifications
+for select
+to authenticated
+using (
+  app_private.current_profile_role() = 'store'
+  and store_id = app_private.current_profile_store_id()
+);
+
+drop policy if exists "appointment_notifications_insert_allowed" on public.appointment_notifications;
+create policy "appointment_notifications_insert_allowed"
+on public.appointment_notifications
+for insert
+to authenticated
+with check (
+  app_private.current_profile_role() in ('admin', 'optometrist')
+  or store_id = app_private.current_profile_store_id()
+);
+
+drop policy if exists "appointment_notifications_store_update_own" on public.appointment_notifications;
+create policy "appointment_notifications_store_update_own"
+on public.appointment_notifications
+for update
+to authenticated
+using (
+  app_private.current_profile_role() = 'store'
+  and store_id = app_private.current_profile_store_id()
+)
+with check (
+  app_private.current_profile_role() = 'store'
+  and store_id = app_private.current_profile_store_id()
+);
+
+drop policy if exists "appointment_notifications_store_delete_own" on public.appointment_notifications;
+create policy "appointment_notifications_store_delete_own"
+on public.appointment_notifications
+for delete
+to authenticated
+using (
   app_private.current_profile_role() = 'store'
   and store_id = app_private.current_profile_store_id()
 );
