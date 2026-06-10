@@ -905,6 +905,39 @@ label { display: grid; gap: 7px; color: var(--text2); font-size: .82rem; font-we
 
 .stat span { font-size: 2rem; font-weight: 900; color: var(--primary2); }
 .stat small { color: var(--text2); font-weight: 800; text-transform: uppercase; }
+.stat em {
+  color: var(--text2);
+  font-size: .82rem;
+  font-style: normal;
+  font-weight: 700;
+}
+
+.appointment-stats-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(130px, 1fr));
+  gap: 10px;
+  margin-bottom: 0;
+}
+
+.stats-range {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  color: var(--text2);
+  font-weight: 800;
+}
+
+.stats-store-panel {
+  box-shadow: none;
+}
+
+.stats-store-row {
+  cursor: default;
+}
+
+.stats-store-row:hover {
+  background: transparent;
+}
 
 .panel { overflow: hidden; }
 
@@ -1150,6 +1183,13 @@ label { display: grid; gap: 7px; color: var(--text2); font-size: .82rem; font-we
   margin-top: 10px;
 }
 
+.rx-print-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
 .notification-list {
   display: grid;
   gap: 10px;
@@ -1302,6 +1342,22 @@ label { display: grid; gap: 7px; color: var(--text2); font-size: .82rem; font-we
   align-items: center;
 }
 
+.check-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: fit-content;
+  color: var(--text);
+  font-weight: 800;
+  text-transform: none;
+}
+
+.check-row input {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--primary);
+}
+
 .toast-wrap {
   position: fixed;
   right: 18px;
@@ -1323,6 +1379,26 @@ label { display: grid; gap: 7px; color: var(--text2); font-size: .82rem; font-we
   box-shadow: var(--shadow);
   font-weight: 800;
   pointer-events: auto;
+}
+
+.toast span {
+  flex: 1;
+  min-width: 0;
+}
+
+.toast-close {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: 7px;
+  color: currentColor;
+  background: rgba(255,255,255,.16);
+}
+
+.toast-close:hover {
+  background: rgba(255,255,255,.28);
 }
 
 .toast.success { background: var(--green); }
@@ -1352,6 +1428,15 @@ label { display: grid; gap: 7px; color: var(--text2); font-size: .82rem; font-we
 .prescription-realtime-alert span {
   display: grid;
   gap: 2px;
+}
+
+.prescription-realtime-alert .toast-close {
+  margin-left: auto;
+  background: rgba(124,45,18,.12);
+}
+
+.prescription-realtime-alert .toast-close:hover {
+  background: rgba(124,45,18,.2);
 }
 
 .prescription-realtime-alert small {
@@ -2540,6 +2625,84 @@ textarea {
 .modal-foot .btn,
 .modal-foot .modal-close {
   border-radius: 7px;
+}
+
+.modal-box.appointment-stats-modal {
+  width: min(560px, calc(100vw - 28px));
+  max-width: calc(100vw - 28px);
+  overflow-x: hidden;
+}
+
+.appointment-stats-modal .modal-head {
+  padding: 14px 16px;
+}
+
+.appointment-stats-modal .modal-head h3 {
+  min-width: 0;
+  font-size: 1.05rem;
+  line-height: 1.2;
+}
+
+.appointment-stats-modal .modal-close {
+  width: 38px;
+  height: 38px;
+  flex: 0 0 auto;
+}
+
+.appointment-stats-modal .modal-body {
+  width: 100%;
+  min-width: 0;
+  padding: 16px;
+  overflow-x: hidden;
+}
+
+.appointment-stats-modal .appointment-stats-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  width: 100%;
+}
+
+.appointment-stats-modal .stat {
+  min-width: 0;
+  padding: 12px;
+  box-shadow: none;
+}
+
+.appointment-stats-modal .stat span {
+  font-size: 1.7rem;
+  line-height: 1;
+}
+
+.appointment-stats-modal .stat small,
+.appointment-stats-modal .stat em {
+  font-size: .74rem;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+
+.appointment-stats-modal .stats-range {
+  min-width: 0;
+  font-size: .9rem;
+}
+
+.appointment-stats-modal .stats-range span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.appointment-stats-modal .stats-store-row {
+  padding: 11px 12px;
+}
+
+.appointment-stats-modal .modal-foot {
+  grid-template-columns: 1fr;
+  padding: 12px 16px 14px;
+}
+
+@media (max-width: 520px) {
+  .appointment-stats-modal .appointment-stats-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 .auth-panel,

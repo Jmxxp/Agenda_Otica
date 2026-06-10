@@ -10,7 +10,9 @@ const WEEKDAY_TIMES = [
   '17:00', '17:30', '18:00',
 ];
 const SOUND_PREF_KEY = 'otica_prescription_sound';
+const SOUND_MUTED_KEY = 'otica_prescription_sound_muted';
 const LOCAL_APPOINTMENT_NOTIFICATIONS_KEY = 'otica_appointment_notifications';
+const APPOINTMENT_NOTIFICATIONS_DISABLED_KEY = 'otica_appointment_notifications_disabled';
 const NOTIFICATION_SOUNDS = [
   { id: 'rotating-bell', label: 'Sininho giratorio', src: 'assets/sounds/rotating-bicycle-bell.wav' },
   { id: 'ding-dong', label: 'Ding dong', src: 'assets/sounds/ding-dong-bicycle-bell.ogg' },
@@ -36,7 +38,7 @@ const DB = {
   prescriptionNotifications: [],
   appointmentNotifications: [],
   prescriptionNotificationsAvailable: true,
-  appointmentNotificationsAvailable: true,
+  appointmentNotificationsAvailable: localStorage.getItem(APPOINTMENT_NOTIFICATIONS_DISABLED_KEY) !== '1',
   lastPrescriptionRealtimeToast: null,
   lastAppointmentCancelToast: null,
   lastSync: null,
@@ -181,6 +183,7 @@ const DB = {
 
   async loadAppointmentNotifications() {
     if (this.profile?.role !== 'store' || !this.profile.store_id) return [];
+    if (!this.appointmentNotificationsAvailable) return this.loadLocalAppointmentNotifications();
     const { data, error } = await this.client
       .from('appointment_notifications')
       .select('*')
@@ -190,6 +193,7 @@ const DB = {
 
     if (isMissingTableError(error)) {
       this.appointmentNotificationsAvailable = false;
+      localStorage.setItem(APPOINTMENT_NOTIFICATIONS_DISABLED_KEY, '1');
       return this.loadLocalAppointmentNotifications();
     }
     if (error) throw error;
@@ -768,6 +772,7 @@ const DB = {
     if (!appointment?.store_id) return;
     const notification = this.buildAppointmentNotification(appointment);
     if (this.profile?.role === 'store') this.addLocalAppointmentNotification(notification);
+    if (!this.appointmentNotificationsAvailable) return;
 
     const { error } = await this.client
       .from('appointment_notifications')
@@ -775,6 +780,7 @@ const DB = {
 
     if (isMissingTableError(error)) {
       this.appointmentNotificationsAvailable = false;
+      localStorage.setItem(APPOINTMENT_NOTIFICATIONS_DISABLED_KEY, '1');
       return;
     }
     if (error) throw error;
@@ -824,6 +830,10 @@ const DB = {
   async markAppointmentNotificationsRead() {
     if (this.profile?.role !== 'store' || !this.profile.store_id) return;
     this.markLocalAppointmentNotificationsRead();
+    if (!this.appointmentNotificationsAvailable) {
+      await this.refresh();
+      return;
+    }
 
     const { error } = await this.client
       .from('appointment_notifications')
@@ -833,6 +843,7 @@ const DB = {
 
     if (isMissingTableError(error)) {
       this.appointmentNotificationsAvailable = false;
+      localStorage.setItem(APPOINTMENT_NOTIFICATIONS_DISABLED_KEY, '1');
       return;
     }
     if (error) throw error;
@@ -846,6 +857,7 @@ const DB = {
       await this.refresh();
       return;
     }
+    if (!this.appointmentNotificationsAvailable) return;
 
     const { error } = await this.client
       .from('appointment_notifications')
@@ -856,6 +868,7 @@ const DB = {
 
     if (isMissingTableError(error)) {
       this.appointmentNotificationsAvailable = false;
+      localStorage.setItem(APPOINTMENT_NOTIFICATIONS_DISABLED_KEY, '1');
       return;
     }
     if (error) throw error;
@@ -879,14 +892,21 @@ const DB = {
       .from('prescription_notifications')
       .delete()
       .eq('store_id', this.profile.store_id);
-    const appointmentDelete = this.client
-      .from('appointment_notifications')
-      .delete()
-      .eq('store_id', this.profile.store_id);
+    const appointmentDelete = this.appointmentNotificationsAvailable
+      ? this.client
+        .from('appointment_notifications')
+        .delete()
+        .eq('store_id', this.profile.store_id)
+      : Promise.resolve({ error: null });
 
     const [prescriptionRes, appointmentRes] = await Promise.all([prescriptionDelete, appointmentDelete]);
     if (prescriptionRes.error && !isMissingTableError(prescriptionRes.error)) throw prescriptionRes.error;
-    if (appointmentRes.error && !isMissingTableError(appointmentRes.error)) throw appointmentRes.error;
+    if (appointmentRes.error && isMissingTableError(appointmentRes.error)) {
+      this.appointmentNotificationsAvailable = false;
+      localStorage.setItem(APPOINTMENT_NOTIFICATIONS_DISABLED_KEY, '1');
+    } else if (appointmentRes.error) {
+      throw appointmentRes.error;
+    }
 
     const localItems = this.loadAllLocalAppointmentNotifications()
       .filter(item => item.store_id !== this.profile.store_id);
@@ -1011,6 +1031,8 @@ const App = {
   audioContext: null,
   audioUnlocked: false,
   notificationSoundId: localStorage.getItem(SOUND_PREF_KEY) || 'bell',
+  notificationSoundMuted: localStorage.getItem(SOUND_MUTED_KEY) === '1',
+  dismissedPrescriptionAlerts: new Set(),
 
   async boot() {
     this.bindAuth();
@@ -1152,6 +1174,7 @@ const App = {
     document.getElementById('btn-menu').onclick = () => document.getElementById('sidebar').classList.toggle('open');
     document.getElementById('btn-theme').onclick = () => this.toggleTheme();
     document.getElementById('btn-settings').onclick = () => this.openSettingsModal();
+    document.getElementById('btn-appointment-stats').onclick = () => this.openAppointmentStats();
     document.getElementById('btn-prescription-notifications').onclick = () => this.openPrescriptionNotifications();
 
     document.querySelectorAll('.nav-btn').forEach(btn => {
@@ -1255,15 +1278,30 @@ const App = {
     if (!wrap) return;
     wrap.querySelectorAll('.prescription-realtime-alert').forEach(alert => alert.remove());
 
-    const unread = this.unreadPrescriptionNotifications();
+    const unread = this.unreadPrescriptionNotifications()
+      .filter(item => !this.dismissedPrescriptionAlerts.has(String(item.id)));
     unread.slice(0, 3).forEach(item => {
-      const button = document.createElement('button');
-      button.className = 'toast info prescription-realtime-alert';
-      button.type = 'button';
-      button.dataset.notificationId = item.id;
-      button.innerHTML = `<i class="fas fa-sparkles"></i><span><strong>Nova receita pronta</strong><small>${esc(item.client_name || 'Cliente')}</small></span>`;
-      button.addEventListener('click', () => this.openPrescriptionNotification(item.id));
-      wrap.prepend(button);
+      const alert = document.createElement('div');
+      alert.className = 'toast info prescription-realtime-alert';
+      alert.tabIndex = 0;
+      alert.role = 'button';
+      alert.dataset.notificationId = item.id;
+      alert.innerHTML = `<i class="fas fa-sparkles"></i><span><strong>Nova receita pronta</strong><small>${esc(item.client_name || 'Cliente')}</small></span><button class="toast-close" type="button" title="Fechar"><i class="fas fa-xmark"></i></button>`;
+      alert.addEventListener('click', event => {
+        if (event.target.closest('.toast-close')) return;
+        this.openPrescriptionNotification(item.id);
+      });
+      alert.addEventListener('keydown', event => {
+        if (event.key !== 'Enter' && event.key !== ' ') return;
+        event.preventDefault();
+        this.openPrescriptionNotification(item.id);
+      });
+      alert.querySelector('.toast-close').addEventListener('click', event => {
+        event.stopPropagation();
+        this.dismissedPrescriptionAlerts.add(String(item.id));
+        alert.remove();
+      });
+      wrap.prepend(alert);
     });
   },
 
@@ -1281,6 +1319,7 @@ const App = {
   },
 
   playPrescriptionNotificationSound() {
+    if (this.notificationSoundMuted) return;
     try {
       const sound = this.getSelectedNotificationSound();
       if (!sound?.src) return;
@@ -1322,11 +1361,15 @@ const App = {
     <form class="modal-body form-stack" id="settings-form">
       <label>Som da nova receita
         <div class="settings-sound-row">
-          <select id="notification-sound">
+          <select id="notification-sound" ${this.notificationSoundMuted ? 'disabled' : ''}>
             ${NOTIFICATION_SOUNDS.map(sound => `<option value="${sound.id}" ${sound.id === currentSound.id ? 'selected' : ''}>${esc(sound.label)}</option>`).join('')}
           </select>
-          <button class="btn btn-secondary" type="button" id="test-notification-sound"><i class="fas fa-volume-high"></i> Testar</button>
+          <button class="btn btn-secondary" type="button" id="test-notification-sound" ${this.notificationSoundMuted ? 'disabled' : ''}><i class="fas fa-volume-high"></i> Testar</button>
         </div>
+      </label>
+      <label class="check-row">
+        <input type="checkbox" id="notification-sound-muted" ${this.notificationSoundMuted ? 'checked' : ''}>
+        <span>Nao fazer barulho nas notificacoes</span>
       </label>
       <div class="modal-foot">
         <button class="btn btn-secondary modal-close" type="button">Cancelar</button>
@@ -1335,15 +1378,27 @@ const App = {
     </form>`);
 
     document.getElementById('test-notification-sound').addEventListener('click', () => {
+      const previousSoundId = this.notificationSoundId;
       this.notificationSoundId = document.getElementById('notification-sound').value;
+      const previousMuted = this.notificationSoundMuted;
+      this.notificationSoundMuted = document.getElementById('notification-sound-muted').checked;
       this.unlockNotificationAudio();
       this.playPrescriptionNotificationSound();
+      this.notificationSoundMuted = previousMuted;
+      this.notificationSoundId = previousSoundId;
+    });
+
+    document.getElementById('notification-sound-muted').addEventListener('change', event => {
+      document.getElementById('notification-sound').disabled = event.target.checked;
+      document.getElementById('test-notification-sound').disabled = event.target.checked;
     });
 
     document.getElementById('settings-form').onsubmit = event => {
       event.preventDefault();
       this.notificationSoundId = document.getElementById('notification-sound').value;
+      this.notificationSoundMuted = document.getElementById('notification-sound-muted').checked;
       localStorage.setItem(SOUND_PREF_KEY, this.notificationSoundId);
+      localStorage.setItem(SOUND_MUTED_KEY, this.notificationSoundMuted ? '1' : '0');
       this.closeModal();
       this.toast('Configuracoes salvas', 'success');
     };
@@ -1404,7 +1459,7 @@ const App = {
     container.querySelectorAll('[data-day]').forEach(day => {
       day.addEventListener('click', () => {
         this.selDate = new Date(y, m, Number(day.dataset.day));
-        this.activateAgendaView('grid');
+        this.activateAgendaView(this.activeView === 'agenda' ? this.scheduleMode : 'grid');
         this.render();
       });
     });
@@ -1532,9 +1587,8 @@ const App = {
     const canToggleAll = DB.profile.role === 'store';
     const showingAll = ['admin', 'optometrist'].includes(DB.profile.role) || this.clientsScope === 'all';
     const clients = showingAll
-      ? [...DB.clients]
+      ? this.getVisibleClientsForAllStores()
       : DB.clients.filter(client => client.store_id === DB.profile.store_id);
-
     const html = `<div class="toolbar">
       <div>
         <h2>Clientes</h2>
@@ -1548,31 +1602,76 @@ const App = {
     ${clients.length ? `<div class="client-grid">
       ${clients.map(client => {
         const store = DB.getStore(client.store_id);
-        const canEdit = DB.canManageStore(client.store_id);
-        return `<button class="client-card" data-client-id="${client.id}" ${canEdit ? '' : 'data-readonly="1"'} style="--store:${store?.color || '#64748b'}">
+        const canEdit = !client.synthetic && DB.canManageStore(client.store_id);
+        return `<button class="client-card" data-client-id="${client.id}" ${client.synthetic ? 'data-synthetic="1"' : ''} ${canEdit ? '' : 'data-readonly="1"'} style="--store:${store?.color || '#64748b'}">
           <span class="client-store"><span class="dot" style="background:${store?.color || '#64748b'}"></span>${esc(store?.name || 'Loja')}</span>
           <strong>${esc(client.name)}</strong>
           <span>${this.fmtPhone(client.phone)}</span>
-          ${client.email ? `<small>${esc(client.email)}</small>` : ''}
+          ${client.synthetic ? '<small>Vindo da agenda</small>' : (client.email ? `<small>${esc(client.email)}</small>` : '')}
         </button>`;
       }).join('')}
     </div>` : this.emptyState('fa-user-group', 'Nenhum cliente ainda', 'Cadastre clientes avulsos ou crie um agendamento.')}`;
 
     document.getElementById('content').innerHTML = html;
-    document.getElementById('toggle-clients')?.addEventListener('click', () => {
-      this.clientsScope = this.clientsScope === 'all' ? 'own' : 'all';
+    document.getElementById('toggle-clients')?.addEventListener('click', async () => {
+      const nextScope = this.clientsScope === 'all' ? 'own' : 'all';
+      if (nextScope === 'all') {
+        try {
+          await DB.refresh();
+        } catch (err) {
+          this.toast(err.message, 'error');
+          return;
+        }
+      }
+      this.clientsScope = nextScope;
       this.renderClients();
     });
     document.getElementById('new-client').onclick = () => this.openClientModal();
     document.querySelectorAll('[data-client-id]').forEach(row => {
       row.addEventListener('click', () => {
+        if (row.dataset.synthetic === '1') {
+          this.toast('Cliente de outra loja visto pela agenda; cadastro completo bloqueado pelo Supabase', 'info');
+          return;
+        }
         const client = DB.getClient(row.dataset.clientId);
+        if (!client) return;
         if (!DB.canManageStore(client.store_id)) {
           this.toast('Cliente de outra loja: somente visualizacao', 'info');
           return;
         }
         this.openClientModal(client);
       });
+    });
+  },
+
+  getVisibleClientsForAllStores() {
+    const byKey = new Map();
+    const keyFor = (storeId, phone, id = '') => `${storeId || ''}:${onlyDigits(phone) || id}`;
+
+    DB.clients.forEach(client => {
+      byKey.set(keyFor(client.store_id, client.phone, client.id), { ...client, synthetic: false });
+    });
+
+    DB.appointments.forEach(apt => {
+      if (!apt.store_id || apt.status === 'cancelled') return;
+      const phone = apt.client_phone || '';
+      const key = keyFor(apt.store_id, phone, apt.client_id || apt.id);
+      if (byKey.has(key)) return;
+      byKey.set(key, {
+        id: `appointment-client:${apt.store_id}:${onlyDigits(phone) || apt.id}`,
+        store_id: apt.store_id,
+        name: apt.client_name || 'Cliente',
+        phone,
+        email: '',
+        notes: '',
+        synthetic: true,
+      });
+    });
+
+    return [...byKey.values()].sort((a, b) => {
+      const storeA = DB.getStore(a.store_id)?.name || '';
+      const storeB = DB.getStore(b.store_id)?.name || '';
+      return storeA.localeCompare(storeB, 'pt-BR') || a.name.localeCompare(b.name, 'pt-BR');
     });
   },
 
@@ -1644,6 +1743,66 @@ const App = {
     document.querySelectorAll('[data-optometrist-id]').forEach(row => {
       row.addEventListener('click', () => this.openOptometristModal(DB.getOptometrist(row.dataset.optometristId)));
     });
+  },
+
+  openAppointmentStats() {
+    const selected = new Date(this.selDate);
+    const weekStart = startOfWeekMonday(selected);
+    const weekEnd = endOfDay(addDays(weekStart, 6));
+    const monthStart = new Date(selected.getFullYear(), selected.getMonth(), 1);
+    const monthEnd = endOfDay(new Date(selected.getFullYear(), selected.getMonth() + 1, 0));
+    const yearStart = new Date(selected.getFullYear(), 0, 1);
+    const yearEnd = endOfDay(new Date(selected.getFullYear(), 11, 31));
+    const visibleAppointments = DB.appointments.filter(apt => apt.status !== 'cancelled');
+    const countBetween = (start, end, storeId = null) => visibleAppointments.filter(apt => {
+      if (storeId && apt.store_id !== storeId) return false;
+      const date = parseLocalDate(apt.date);
+      return date >= start && date <= end;
+    }).length;
+    const statItems = [
+      { label: 'Semana', value: countBetween(weekStart, weekEnd), range: `${this.fmtDateDisplay(weekStart)} a ${this.fmtDateDisplay(weekEnd)}` },
+      { label: 'Mes', value: countBetween(monthStart, monthEnd), range: `${MONTHS[selected.getMonth()]} ${selected.getFullYear()}` },
+      { label: 'Ano', value: countBetween(yearStart, yearEnd), range: String(selected.getFullYear()) },
+    ];
+    const stores = ['admin', 'optometrist'].includes(DB.profile.role)
+      ? DB.stores
+      : DB.stores.filter(store => store.id === DB.profile.store_id);
+
+    this.openModal(`<div class="modal-head">
+      <h3>Agendamentos</h3>
+      <button class="modal-close">&times;</button>
+    </div>
+    <div class="modal-body form-stack appointment-stats-body">
+      <div class="stats-range">
+        <i class="fas fa-calendar-day"></i>
+        <span>Referencia: ${this.fmtDateDisplay(selected)}</span>
+      </div>
+      <div class="appointment-stats-grid">
+        ${statItems.map(item => `<div class="stat">
+          <span>${item.value}</span>
+          <small>${item.label}</small>
+          <em>${item.range}</em>
+        </div>`).join('')}
+      </div>
+      ${stores.length > 1 ? `<div class="panel stats-store-panel">
+        <div class="panel-head">
+          <h3>Por loja</h3>
+          <span>${stores.length} loja(s)</span>
+        </div>
+        <div class="store-list">
+          ${stores.map(store => `<div class="store-row stats-store-row">
+            <span class="store-color" style="background:${store.color}"></span>
+            <div>
+              <strong>${esc(store.name)}</strong>
+              <small>Semana ${countBetween(weekStart, weekEnd, store.id)} - Mes ${countBetween(monthStart, monthEnd, store.id)} - Ano ${countBetween(yearStart, yearEnd, store.id)}</small>
+            </div>
+          </div>`).join('')}
+        </div>
+      </div>` : ''}
+      <div class="modal-foot">
+        <button class="btn btn-secondary modal-close" type="button">Fechar</button>
+      </div>
+    </div>`);
   },
 
   openAppointmentModal(defaults = {}) {
@@ -1780,7 +1939,7 @@ const App = {
     </div>
     <form class="modal-body form-stack" id="appointment-detail-form">
       <label>Loja
-        <input type="text" value="${esc(store?.name || 'Loja')}" disabled>
+        <input type="text" id="apt-store-name" value="${esc(store?.name || 'Loja')}" disabled>
       </label>
       <div class="field-row">
         <label>Data
@@ -1804,6 +1963,7 @@ const App = {
         newEditable: canEditNewPrescription,
         newDeletable: canDeleteNewPrescription,
         clientId: client?.id,
+        printEnabled: Boolean(client),
       })}
       <div class="modal-foot appointment-actions">
         <button class="btn btn-whatsapp" type="button" id="whatsapp"><i class="fab fa-whatsapp"></i> WhatsApp</button>
@@ -1907,6 +2067,7 @@ const App = {
         newDeletable: canDeleteNewPrescription,
         activeTab: options.activePrescription,
         clientId: client?.id,
+        printEnabled: Boolean(client),
       })}
       <div class="modal-foot client-actions">
         <button class="btn btn-secondary modal-close" type="button">Cancelar</button>
@@ -1956,7 +2117,7 @@ const App = {
     const activeTab = requestedTab || (permissions.newEditable && !permissions.currentEditable ? 'new' : 'current');
     const clientAttr = permissions.clientId ? ` data-rx-client-id="${esc(permissions.clientId)}"` : '';
 
-    return `<fieldset class="prescription-grid-field">
+    return `<fieldset class="prescription-grid-field"${clientAttr}>
       <legend>Receita do oculos</legend>
       <div class="rx-toggle" role="tablist" data-rx-active-tab="${activeTab}"${clientAttr}>
         <button class="rx-toggle-btn ${activeTab === 'current' ? 'active' : ''}" type="button" data-rx-tab="current">Receita atual</button>
@@ -1967,6 +2128,10 @@ const App = {
       </div>
       <div class="rx-panel ${activeTab === 'new' ? 'active' : 'hidden'}" data-rx-panel="new">
         ${this.renderPrescriptionGrid(newPrescription, newDisabled, 'new')}
+        ${permissions.printEnabled ? `<div class="rx-print-actions">
+          <button class="btn btn-secondary" type="button" data-print-prescription="a4"><i class="fas fa-print"></i> Imprimir A4</button>
+          <button class="btn btn-secondary" type="button" data-print-prescription="thermal"><i class="fas fa-receipt"></i> Imprimir cupom</button>
+        </div>` : ''}
         ${permissions.newDeletable ? '<button class="btn btn-danger rx-delete-new-prescription" type="button" data-delete-new-prescription><i class="fas fa-trash"></i> Excluir nova receita</button>' : ''}
       </div>
     </fieldset>`;
@@ -2258,6 +2423,9 @@ const App = {
     if (overlay.querySelector('.rx-prescription')) {
       overlay.querySelector('.modal-box').classList.add('prescription-modal');
     }
+    if (overlay.querySelector('.appointment-stats-body')) {
+      overlay.querySelector('.modal-box').classList.add('appointment-stats-modal');
+    }
     document.body.appendChild(overlay);
     overlay.addEventListener('click', event => {
       if (event.target === overlay) this.closeModal();
@@ -2267,6 +2435,158 @@ const App = {
     this.bindNewPrescriptionDelete(overlay);
     this.bindPrescriptionTabs(overlay);
     this.bindPrescriptionInputs(overlay);
+    this.bindPrescriptionPrint(overlay);
+  },
+
+  bindPrescriptionPrint(scope) {
+    scope.querySelectorAll('[data-print-prescription]').forEach(button => {
+      button.addEventListener('click', () => {
+        const prescription = this.readPrescriptionGrid('new');
+        if (isPrescriptionEmpty(prescription)) {
+          this.toast('Preencha a nova receita antes de imprimir', 'error');
+          return;
+        }
+        this.openPrescriptionPrintWindow(prescription, this.getPrescriptionPrintContext(), button.dataset.printPrescription);
+      });
+    });
+  },
+
+  getPrescriptionPrintContext() {
+    const storeSelect = document.getElementById('client-store');
+    const storeName = document.getElementById('apt-store-name')?.value
+      || storeSelect?.selectedOptions?.[0]?.textContent
+      || DB.profile?.stores?.name
+      || 'Loja';
+    return {
+      clientName: document.getElementById('client-name')?.value.trim()
+        || document.getElementById('apt-client')?.value.trim()
+        || 'Cliente',
+      storeName: storeName.trim(),
+      printedAt: new Date(),
+    };
+  },
+
+  openPrescriptionPrintWindow(prescription, context, paper) {
+    const win = window.open('', '_blank', 'width=900,height=720');
+    if (!win) {
+      this.toast('O navegador bloqueou a janela de impressao', 'error');
+      return;
+    }
+
+    win.document.open();
+    win.document.write(this.buildPrescriptionPrintHtml(prescription, context, paper));
+    win.document.close();
+    win.focus();
+    setTimeout(() => win.print(), 250);
+  },
+
+  buildPrescriptionPrintHtml(prescription, context, paper = 'a4') {
+    const fields = [
+      ['spherical', 'Esferico'],
+      ['cylindrical', 'Cilindrico'],
+      ['axis', 'Eixo'],
+      ['dnp', 'DNP'],
+      ['height', 'Altura'],
+    ];
+    const value = (distance, eye, key) => esc(prescription?.[distance]?.[eye]?.[key] || '-');
+    const rows = fields.map(([key, label]) => `<tr>
+      <th>${label}</th>
+      <td>${value('far', 'od', key)}</td>
+      <td>${value('far', 'oe', key)}</td>
+      <td>${value('near', 'od', key)}</td>
+      <td>${value('near', 'oe', key)}</td>
+    </tr>`).join('');
+    const printedDate = this.fmtDateDisplay(context.printedAt);
+    const isThermal = paper === 'thermal';
+
+    return `<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <title>Receita nova - ${esc(context.clientName)}</title>
+  <style>
+    @page { size: ${isThermal ? '80mm 200mm' : 'A4'}; margin: ${isThermal ? '5mm' : '14mm'}; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      color: #111827;
+      font-family: Arial, Helvetica, sans-serif;
+      font-size: ${isThermal ? '10px' : '14px'};
+      line-height: 1.35;
+    }
+    .sheet {
+      width: ${isThermal ? '70mm' : '100%'};
+      max-width: ${isThermal ? '70mm' : '180mm'};
+      margin: 0 auto;
+    }
+    h1 {
+      margin: 0 0 ${isThermal ? '8px' : '18px'};
+      font-size: ${isThermal ? '16px' : '28px'};
+      text-align: ${isThermal ? 'center' : 'left'};
+    }
+    .meta {
+      display: grid;
+      gap: ${isThermal ? '3px' : '6px'};
+      margin-bottom: ${isThermal ? '8px' : '18px'};
+      padding-bottom: ${isThermal ? '7px' : '14px'};
+      border-bottom: 1px solid #111827;
+    }
+    .meta strong { display: inline-block; min-width: ${isThermal ? '0' : '72px'}; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      table-layout: fixed;
+      font-size: ${isThermal ? '9px' : '13px'};
+    }
+    th, td {
+      border: 1px solid #111827;
+      padding: ${isThermal ? '4px 2px' : '9px 7px'};
+      text-align: center;
+      vertical-align: middle;
+      word-break: break-word;
+    }
+    th { font-weight: 800; background: #f3f4f6; }
+    thead th:first-child, tbody th { text-align: left; }
+    .addition {
+      margin-top: ${isThermal ? '8px' : '14px'};
+      padding: ${isThermal ? '6px' : '10px 12px'};
+      border: 1px solid #111827;
+      font-weight: 800;
+    }
+    .signature {
+      margin-top: ${isThermal ? '18px' : '44px'};
+      padding-top: 8px;
+      border-top: 1px solid #111827;
+      text-align: center;
+      color: #374151;
+    }
+  </style>
+</head>
+<body>
+  <main class="sheet">
+    <h1>Nova receita</h1>
+    <section class="meta">
+      <div><strong>Cliente:</strong> ${esc(context.clientName)}</div>
+      <div><strong>Loja:</strong> ${esc(context.storeName)}</div>
+      <div><strong>Data:</strong> ${printedDate}</div>
+    </section>
+    <table>
+      <thead>
+        <tr>
+          <th>Campo</th>
+          <th>OD longe</th>
+          <th>OE longe</th>
+          <th>OD perto</th>
+          <th>OE perto</th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <div class="addition">Adicao: ${esc(prescription.addition || '-')}</div>
+    <div class="signature">Assinatura / carimbo</div>
+  </main>
+</body>
+</html>`;
   },
 
   bindNewPrescriptionDelete(scope) {
@@ -2361,8 +2681,9 @@ const App = {
     const el = document.createElement('div');
     const icon = type === 'success' ? 'check' : type === 'error' ? 'exclamation-triangle' : 'info-circle';
     el.className = `toast ${type}`;
-    el.innerHTML = `<i class="fas fa-${icon}"></i>${esc(message)}`;
+    el.innerHTML = `<i class="fas fa-${icon}"></i><span>${esc(message)}</span><button class="toast-close" type="button" title="Fechar"><i class="fas fa-xmark"></i></button>`;
     wrap.appendChild(el);
+    el.querySelector('.toast-close').addEventListener('click', () => el.remove());
     setTimeout(() => el.remove(), 3500);
   },
 
@@ -2479,6 +2800,27 @@ function parseLocalDate(value) {
   return new Date(y, m - 1, d);
 }
 
+function addDays(date, days) {
+  const out = new Date(date);
+  out.setDate(out.getDate() + days);
+  return out;
+}
+
+function endOfDay(date) {
+  const out = new Date(date);
+  out.setHours(23, 59, 59, 999);
+  return out;
+}
+
+function startOfWeekMonday(date) {
+  const out = new Date(date);
+  const day = out.getDay();
+  const offset = day === 0 ? -6 : 1 - day;
+  out.setDate(out.getDate() + offset);
+  out.setHours(0, 0, 0, 0);
+  return out;
+}
+
 function emptyPrescription() {
   const row = () => ({ spherical: '', cylindrical: '', axis: '', dnp: '', height: '' });
   return {
@@ -2547,7 +2889,8 @@ function isMissingTableError(error) {
   return error?.code === '42P01'
     || error?.code === 'PGRST205'
     || message.includes('Could not find the table')
-    || message.includes('relation "public.prescription_notifications" does not exist');
+    || message.includes('relation "public.prescription_notifications" does not exist')
+    || message.includes('relation "public.appointment_notifications" does not exist');
 }
 
 function labelStatus(value) {
