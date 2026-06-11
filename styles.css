@@ -3038,13 +3038,14 @@ textarea {
   }
 
   .schedule-grid .grid-store-header {
-    display: grid;
-    grid-template-columns: 7px minmax(0, 1fr);
+    display: flex;
+    align-items: center;
+    justify-content: center;
     gap: 4px;
-    text-align: left;
-    justify-content: start;
+    text-align: center;
     overflow: hidden;
     text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .schedule-grid .grid-store-header .dot {
