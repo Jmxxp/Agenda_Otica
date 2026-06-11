@@ -1489,6 +1489,7 @@ const App = {
 
     const times = getTimesForDate(this.selDate);
     const appointments = DB.appointments.filter(a => a.date === dateStr && a.status !== 'cancelled');
+    const occupiedTimes = new Set(appointments.map(apt => normalizeTime(apt.time)));
     const gridCols = `76px repeat(${stores.length}, minmax(150px, 1fr))`;
 
     let html = `<div class="schedule-grid" style="grid-template-columns:${gridCols}">`;
@@ -1501,7 +1502,7 @@ const App = {
       html += `<div class="grid-time">${time}</div>`;
       stores.forEach(store => {
         const apt = appointments.find(a => a.store_id === store.id && normalizeTime(a.time) === time);
-        const canAdd = DB.canManageStore(store.id) && !apt;
+        const canAdd = DB.canManageStore(store.id) && !apt && !occupiedTimes.has(time);
         if (apt) {
           const hasNewPrescription = this.hasUnreadPrescriptionForAppointment(apt);
           html += `<div class="grid-cell filled" data-apt-id="${apt.id}">
@@ -1818,7 +1819,11 @@ const App = {
     const selectedStoreId = defaults.store_id || allowedStores[0].id;
     const store = DB.getStore(selectedStoreId) || allowedStores[0];
     const dateValue = isSunday(this.selDate) ? this.fmtDate(nextOpenDate(this.selDate)) : this.fmtDate(this.selDate);
-    const initialTimes = getTimesForDate(parseLocalDate(dateValue));
+    const initialTimes = this.getAvailableAppointmentTimes(dateValue);
+    if (!initialTimes.length && !defaults.time) {
+      this.toast('Todos os horarios deste dia ja estao ocupados', 'error');
+      return;
+    }
     const time = defaults.time || initialTimes[0] || '08:00';
     const openedFromScheduleCell = Boolean(defaults.store_id && defaults.time);
     const hideSlotFields = DB.profile.role === 'store' || openedFromScheduleCell;
@@ -1876,10 +1881,10 @@ const App = {
     };
 
     if (dateField.type === 'date') dateField.onchange = event => {
-      const date = parseLocalDate(event.target.value);
-      const times = getTimesForDate(date);
+      const times = this.getAvailableAppointmentTimes(event.target.value);
       document.getElementById('apt-time').innerHTML = times.map(t => `<option value="${t}">${t}</option>`).join('');
-      if (!times.length) this.toast('Fechado aos domingos', 'error');
+      if (isSunday(parseLocalDate(event.target.value))) this.toast('Fechado aos domingos', 'error');
+      else if (!times.length) this.toast('Todos os horarios deste dia ja estao ocupados', 'error');
     };
 
     document.getElementById('apt-client').onchange = event => {
@@ -1902,7 +1907,7 @@ const App = {
         return;
       }
       if (this.hasAppointmentConflict(payload)) {
-        this.toast('Este horario ja esta ocupado nesta loja', 'error');
+        this.toast('Este horario ja esta ocupado', 'error');
         return;
       }
       try {
@@ -1926,7 +1931,9 @@ const App = {
       || DB.clients.find(row => row.store_id === apt.store_id && row.phone === apt.client_phone)
       || null;
     const canEdit = DB.canManageStore(apt.store_id);
-    const times = getTimesForDate(parseLocalDate(apt.date));
+    const currentTime = normalizeTime(apt.time);
+    const times = this.getAvailableAppointmentTimes(apt.date, apt.id);
+    if (!times.includes(currentTime)) times.push(currentTime);
     const currentPrescription = parsePrescription(client?.prescription);
     const newPrescription = parsePrescription(client?.new_prescription);
     const canEditCurrentPrescription = canEdit && ['admin', 'store'].includes(DB.profile.role);
@@ -1972,6 +1979,17 @@ const App = {
       </div>
     </form>`);
 
+    if (canEdit) {
+      document.getElementById('apt-date')?.addEventListener('change', event => {
+        const availableTimes = this.getAvailableAppointmentTimes(event.target.value, apt.id);
+        document.getElementById('apt-time').innerHTML = availableTimes
+          .map(t => `<option value="${t}">${t}</option>`)
+          .join('');
+        if (isSunday(parseLocalDate(event.target.value))) this.toast('Fechado aos domingos', 'error');
+        else if (!availableTimes.length) this.toast('Todos os horarios deste dia ja estao ocupados', 'error');
+      });
+    }
+
     document.getElementById('whatsapp').onclick = () => {
       const phone = onlyDigits(document.getElementById('apt-phone').value);
       const name = document.getElementById('apt-client').value || 'cliente';
@@ -2010,7 +2028,7 @@ const App = {
         status: apt.status || 'scheduled',
       };
       if (this.hasAppointmentConflict(payload, apt.id)) {
-        this.toast('Este horario ja esta ocupado nesta loja', 'error');
+        this.toast('Este horario ja esta ocupado', 'error');
         return;
       }
       if (isSunday(parseLocalDate(payload.date))) {
@@ -2139,8 +2157,8 @@ const App = {
 
   renderPrescriptionGrid(prescription, disabled = false, kind = 'current') {
     const columns = [
-      ['spherical', 'Esferico'],
-      ['cylindrical', 'Cilindrico'],
+      ['spherical', 'Esférico'],
+      ['cylindrical', 'Cilíndrico'],
       ['axis', 'Eixo'],
       ['dnp', 'DNP'],
       ['height', 'Altura'],
@@ -2404,14 +2422,22 @@ const App = {
     };
   },
 
-  hasAppointmentConflict(payload, ignoreId = null) {
+  isAppointmentSlotTaken(date, time, ignoreId = null) {
     return DB.appointments.some(apt => {
       return apt.id !== ignoreId
-        && apt.store_id === payload.store_id
-        && apt.date === payload.date
-        && normalizeTime(apt.time) === normalizeTime(payload.time)
+        && apt.date === date
+        && normalizeTime(apt.time) === normalizeTime(time)
         && apt.status !== 'cancelled';
     });
+  },
+
+  getAvailableAppointmentTimes(date, ignoreId = null) {
+    return getTimesForDate(parseLocalDate(date))
+      .filter(time => !this.isAppointmentSlotTaken(date, time, ignoreId));
+  },
+
+  hasAppointmentConflict(payload, ignoreId = null) {
+    return this.isAppointmentSlotTaken(payload.date, payload.time, ignoreId);
   },
 
   openModal(html) {
@@ -2481,23 +2507,34 @@ const App = {
   },
 
   buildPrescriptionPrintHtml(prescription, context, paper = 'a4') {
-    const fields = [
-      ['spherical', 'Esferico'],
-      ['cylindrical', 'Cilindrico'],
+    const columns = [
+      ['spherical', 'Esférico'],
+      ['cylindrical', 'Cilíndrico'],
       ['axis', 'Eixo'],
       ['dnp', 'DNP'],
       ['height', 'Altura'],
     ];
-    const value = (distance, eye, key) => esc(prescription?.[distance]?.[eye]?.[key] || '-');
-    const rows = fields.map(([key, label]) => `<tr>
-      <th>${label}</th>
-      <td>${value('far', 'od', key)}</td>
-      <td>${value('far', 'oe', key)}</td>
-      <td>${value('near', 'od', key)}</td>
-      <td>${value('near', 'oe', key)}</td>
-    </tr>`).join('');
+    const value = (distance, eye, key) => esc(prescription?.[distance]?.[eye]?.[key] || '');
+    const cell = (distance, eye, key) => `<div class="rx-print-cell">${value(distance, eye, key)}</div>`;
     const printedDate = this.fmtDateDisplay(context.printedAt);
     const isThermal = paper === 'thermal';
+    const printGrid = `<section class="rx-print-prescription">
+      <div class="rx-print-header-row">
+        ${columns.map(([, label]) => `<div class="rx-print-head">${label}</div>`).join('')}
+      </div>
+      <div class="rx-print-body-grid">
+        <div class="rx-print-distance far">Longe</div>
+        <div class="rx-print-eye far">OD</div>
+        ${columns.map(([key]) => cell('far', 'od', key)).join('')}
+        <div class="rx-print-eye far">OE</div>
+        ${columns.map(([key]) => cell('far', 'oe', key)).join('')}
+        <div class="rx-print-distance near">Perto</div>
+        <div class="rx-print-eye near">OD</div>
+        ${columns.map(([key]) => cell('near', 'od', key)).join('')}
+        <div class="rx-print-eye near">OE</div>
+        ${columns.map(([key]) => cell('near', 'oe', key)).join('')}
+      </div>
+    </section>`;
 
     return `<!DOCTYPE html>
 <html lang="pt-BR">
@@ -2509,56 +2546,141 @@ const App = {
     * { box-sizing: border-box; }
     body {
       margin: 0;
-      color: #111827;
+      color: #000;
       font-family: Arial, Helvetica, sans-serif;
-      font-size: ${isThermal ? '10px' : '14px'};
+      font-size: ${isThermal ? '8px' : '14px'};
       line-height: 1.35;
     }
     .sheet {
       width: ${isThermal ? '70mm' : '100%'};
-      max-width: ${isThermal ? '70mm' : '180mm'};
+      max-width: ${isThermal ? '70mm' : '170mm'};
       margin: 0 auto;
     }
     h1 {
-      margin: 0 0 ${isThermal ? '8px' : '18px'};
-      font-size: ${isThermal ? '16px' : '28px'};
-      text-align: ${isThermal ? 'center' : 'left'};
+      margin: 0 0 ${isThermal ? '6px' : '14px'};
+      font-size: ${isThermal ? '13px' : '24px'};
+      text-align: center;
     }
     .meta {
       display: grid;
-      gap: ${isThermal ? '3px' : '6px'};
-      margin-bottom: ${isThermal ? '8px' : '18px'};
-      padding-bottom: ${isThermal ? '7px' : '14px'};
-      border-bottom: 1px solid #111827;
+      gap: ${isThermal ? '2px' : '6px'};
+      margin-bottom: ${isThermal ? '6px' : '12px'};
+      padding-bottom: ${isThermal ? '5px' : '10px'};
+      border-bottom: 2px solid #000;
+      font-size: ${isThermal ? '8px' : '14px'};
     }
     .meta strong { display: inline-block; min-width: ${isThermal ? '0' : '72px'}; }
-    table {
+    .rx-print-prescription {
+      --rx-line: #000;
+      --rx-line-w: ${isThermal ? '1px' : '2px'};
+      --rx-label-w: ${isThermal ? '12mm' : '24mm'};
+      --rx-eye-w: ${isThermal ? '8mm' : '14mm'};
+      --rx-measure-w: minmax(0, 1fr);
       width: 100%;
-      border-collapse: collapse;
-      table-layout: fixed;
-      font-size: ${isThermal ? '9px' : '13px'};
     }
-    th, td {
-      border: 1px solid #111827;
-      padding: ${isThermal ? '4px 2px' : '9px 7px'};
+    .rx-print-header-row {
+      display: grid;
+      grid-template-columns: repeat(5, var(--rx-measure-w));
+      margin-left: calc(var(--rx-label-w) + var(--rx-eye-w));
+      border: var(--rx-line-w) solid var(--rx-line);
+      border-bottom: 0;
+      border-radius: ${isThermal ? '5px 5px 0 0' : '12px 12px 0 0'};
+      overflow: hidden;
+      background: #fff;
+    }
+    .rx-print-body-grid {
+      display: grid;
+      grid-template-columns: var(--rx-label-w) var(--rx-eye-w) repeat(5, var(--rx-measure-w));
+      grid-template-rows: repeat(4, ${isThermal ? '7mm' : '9.5mm'});
+      border: var(--rx-line-w) solid var(--rx-line);
+      border-radius: ${isThermal ? '5px 0 5px 5px' : '12px 0 12px 12px'};
+      overflow: hidden;
+      background: #fff;
+    }
+    .rx-print-head,
+    .rx-print-distance,
+    .rx-print-eye,
+    .rx-print-cell {
+      display: grid;
+      place-items: center;
+      min-width: 0;
+      min-height: 0;
+      padding: ${isThermal ? '.4mm' : '1.5mm'};
+      border-right: var(--rx-line-w) solid var(--rx-line);
+      border-bottom: var(--rx-line-w) solid var(--rx-line);
+      background: #fff;
+      color: #000;
       text-align: center;
-      vertical-align: middle;
-      word-break: break-word;
+      overflow-wrap: normal;
+      word-break: normal;
+      hyphens: none;
     }
-    th { font-weight: 800; background: #f3f4f6; }
-    thead th:first-child, tbody th { text-align: left; }
-    .addition {
-      margin-top: ${isThermal ? '8px' : '14px'};
-      padding: ${isThermal ? '6px' : '10px 12px'};
-      border: 1px solid #111827;
+    .rx-print-head {
+      height: ${isThermal ? '7mm' : '9.5mm'};
+      font-size: ${isThermal ? '6px' : '11px'};
+      border-bottom: 0;
+      font-weight: 900;
+      white-space: nowrap;
+    }
+    .rx-print-head:last-child,
+    .rx-print-body-grid > :nth-child(7),
+    .rx-print-body-grid > :nth-child(13),
+    .rx-print-body-grid > :nth-child(20),
+    .rx-print-body-grid > :nth-child(26) {
+      border-right: 0;
+    }
+    .rx-print-distance.near,
+    .rx-print-body-grid > :nth-child(n+21) {
+      border-bottom: 0;
+    }
+    .rx-print-distance {
+      grid-row: span 2;
+    }
+    .rx-print-distance,
+    .rx-print-eye {
+      font-size: ${isThermal ? '7px' : '11px'};
+      font-weight: 900;
+      line-height: 1;
+    }
+    .rx-print-cell {
+      font-size: ${isThermal ? '7px' : '11px'};
+      font-weight: 800;
+    }
+    .rx-print-distance.far,
+    .rx-print-eye.far {
+      color: #000;
+    }
+    .rx-print-distance.near,
+    .rx-print-eye.near {
+      color: #000;
+    }
+    .rx-print-addition {
+      display: grid;
+      grid-template-columns: ${isThermal ? '15mm 1fr' : '32mm 1fr'};
+      align-items: center;
+      gap: ${isThermal ? '2mm' : '5mm'};
+      width: ${isThermal ? '100%' : '90mm'};
+      margin-top: ${isThermal ? '3mm' : '6mm'};
+      padding: ${isThermal ? '1.4mm' : '2.5mm 4mm'};
+      border: ${isThermal ? '1px' : '2px'} solid #000;
+      border-radius: ${isThermal ? '5px' : '10px'};
+      font-weight: 900;
+    }
+    .rx-print-addition-value {
+      min-height: ${isThermal ? '5.5mm' : '9mm'};
+      display: grid;
+      place-items: center;
+      border: ${isThermal ? '1px' : '2px'} solid #000;
+      border-radius: ${isThermal ? '4px' : '7px'};
+      font-size: ${isThermal ? '7px' : '11px'};
       font-weight: 800;
     }
     .signature {
-      margin-top: ${isThermal ? '18px' : '44px'};
-      padding-top: 8px;
-      border-top: 1px solid #111827;
+      margin-top: ${isThermal ? '12px' : '18px'};
+      padding-top: ${isThermal ? '5px' : '10px'};
+      border-top: 2px solid #000;
       text-align: center;
-      color: #374151;
+      color: #000;
     }
   </style>
 </head>
@@ -2570,19 +2692,11 @@ const App = {
       <div><strong>Loja:</strong> ${esc(context.storeName)}</div>
       <div><strong>Data:</strong> ${printedDate}</div>
     </section>
-    <table>
-      <thead>
-        <tr>
-          <th>Campo</th>
-          <th>OD longe</th>
-          <th>OE longe</th>
-          <th>OD perto</th>
-          <th>OE perto</th>
-        </tr>
-      </thead>
-      <tbody>${rows}</tbody>
-    </table>
-    <div class="addition">Adicao: ${esc(prescription.addition || '-')}</div>
+    ${printGrid}
+    <div class="rx-print-addition">
+      <span>Adição</span>
+      <span class="rx-print-addition-value">${esc(prescription.addition || '')}</span>
+    </div>
     <div class="signature">Assinatura / carimbo</div>
   </main>
 </body>
