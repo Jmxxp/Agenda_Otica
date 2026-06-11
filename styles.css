@@ -2840,41 +2840,45 @@ textarea {
   }
 
   .modal-box.prescription-modal .rx-prescription {
-    --rx-label-w: 54px;
-    --rx-eye-w: 36px;
+    --rx-label-w: 48px;
+    --rx-eye-w: 32px;
     --rx-line-w: 2px;
-    --rx-measure-w: minmax(42px, 1fr);
+    --rx-measure-w: minmax(36px, 1fr);
   }
 
   .modal-box.prescription-modal .rx-header-row {
-    margin-left: calc(54px + 36px + (var(--rx-line-w) * 2));
+    margin-left: calc(48px + 32px + (var(--rx-line-w) * 2));
   }
 
   .modal-box.prescription-modal .rx-body-grid {
-    grid-template-rows: repeat(4, 48px);
+    grid-template-rows: repeat(4, 34px);
+  }
+
+  .modal-box.prescription-modal .rx-head {
+    height: 38px;
   }
 
   .modal-box.prescription-modal .rx-head,
   .modal-box.prescription-modal .rx-input {
-    font-size: .72rem;
+    font-size: .62rem;
   }
 
   .modal-box.prescription-modal .rx-distance,
   .modal-box.prescription-modal .rx-eye {
-    font-size: .85rem;
+    font-size: .72rem;
   }
 
   .modal-box.prescription-modal .rx-addition-field {
     grid-template-columns: 1fr;
     width: 100%;
     gap: 7px;
-    padding: 9px;
-    font-size: .85rem;
+    padding: 7px;
+    font-size: .75rem;
   }
 
   .modal-box.prescription-modal .rx-addition-input {
     width: 100%;
-    min-height: 38px;
+    min-height: 30px;
   }
 }
 
