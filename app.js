@@ -1142,6 +1142,17 @@ const App = {
     });
     document.addEventListener('pointerdown', () => this.unlockNotificationAudio(), { once: true });
     document.addEventListener('touchstart', () => this.unlockNotificationAudio(), { once: true });
+
+    let resizeTimer = null;
+    window.addEventListener('resize', () => {
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        const nextMobile = this.isMobileLayout();
+        if (this._lastMobileLayout === nextMobile) return;
+        this._lastMobileLayout = nextMobile;
+        if (!document.getElementById('app')?.classList.contains('hidden')) this.render();
+      }, 140);
+    });
   },
 
   bindAppEvents() {
@@ -1215,6 +1226,7 @@ const App = {
   },
 
   render() {
+    this._lastMobileLayout = this.isMobileLayout();
     this.updateDateHeader();
     this.renderCalendar();
     this.updateConnStatus();
@@ -1469,6 +1481,7 @@ const App = {
     const content = document.getElementById('content');
     const stores = DB.stores;
     const dateStr = this.fmtDate(this.selDate);
+    const isMobile = this.isMobileLayout();
 
     if (!stores.length) {
       content.innerHTML = this.emptyState('fa-store', 'Nenhuma loja cadastrada', DB.profile.role === 'admin'
@@ -1478,11 +1491,13 @@ const App = {
     }
 
     if (isSunday(this.selDate)) {
-      content.innerHTML = this.emptyState('fa-moon', 'Fechado aos domingos', 'Escolha outro dia no calendario.');
+      const empty = this.emptyState('fa-moon', 'Fechado aos domingos', 'Escolha outro dia no calendario.');
+      content.innerHTML = isMobile ? `${this.renderMobileAgendaControls()}${empty}` : empty;
+      if (isMobile) this.bindMobileAgendaControls(content);
       return;
     }
 
-    if (this.scheduleMode === 'simplified') {
+    if (this.scheduleMode === 'simplified' && !isMobile) {
       this.renderSimplified();
       return;
     }
@@ -1490,9 +1505,17 @@ const App = {
     const times = getTimesForDate(this.selDate);
     const appointments = DB.appointments.filter(a => a.date === dateStr && a.status !== 'cancelled');
     const occupiedTimes = new Set(appointments.map(apt => normalizeTime(apt.time)));
-    const gridCols = `76px repeat(${stores.length}, minmax(150px, 1fr))`;
+    if (isMobile && this.scheduleMode === 'simplified') {
+      this.renderMobileSimplifiedAgenda(content, stores, times, appointments, occupiedTimes);
+      return;
+    }
 
-    let html = `<div class="schedule-grid" style="grid-template-columns:${gridCols}">`;
+    const gridCols = isMobile
+      ? `42px repeat(${stores.length}, minmax(58px, 1fr))`
+      : `76px repeat(${stores.length}, minmax(150px, 1fr))`;
+
+    let html = isMobile ? this.renderMobileAgendaControls() : '';
+    html += `<div class="schedule-grid" style="grid-template-columns:${gridCols}">`;
     html += '<div class="grid-corner">Hora</div>';
     stores.forEach(store => {
       html += `<div class="grid-store-header"><span class="dot" style="background:${store.color}"></span>${esc(store.name)}</div>`;
@@ -1521,6 +1544,7 @@ const App = {
     });
     html += '</div>';
     content.innerHTML = html;
+    if (isMobile) this.bindMobileAgendaControls(content);
 
     content.querySelectorAll('[data-apt-id]').forEach(el => {
       el.addEventListener('click', () => this.openAppointmentDetail(el.dataset.aptId));
@@ -1529,6 +1553,90 @@ const App = {
       cell.addEventListener('click', () => this.openAppointmentModal({
         store_id: cell.dataset.store,
         time: cell.dataset.time,
+      }));
+    });
+  },
+
+  isMobileLayout() {
+    return window.matchMedia?.('(max-width: 760px)').matches || window.innerWidth <= 760;
+  },
+
+  renderMobileAgendaControls() {
+    return `<div class="mobile-agenda-controls">
+      <div class="mobile-date-row">
+        <button class="mobile-date-btn" type="button" data-mobile-day="-1" title="Dia anterior"><i class="fas fa-chevron-left"></i></button>
+        <input class="mobile-date-input" type="date" value="${this.fmtDate(this.selDate)}" data-mobile-date>
+        <button class="mobile-date-btn" type="button" data-mobile-day="1" title="Proximo dia"><i class="fas fa-chevron-right"></i></button>
+        <button class="mobile-today-btn" type="button" data-mobile-today>Hoje</button>
+      </div>
+      <div class="mobile-mode-tabs">
+        <button type="button" class="${this.scheduleMode === 'grid' ? 'active' : ''}" data-mobile-mode="grid">Geral</button>
+        <button type="button" class="${this.scheduleMode === 'simplified' ? 'active' : ''}" data-mobile-mode="simplified">Simplificada</button>
+      </div>
+    </div>`;
+  },
+
+  bindMobileAgendaControls(scope) {
+    scope.querySelector('[data-mobile-date]')?.addEventListener('change', event => {
+      if (!event.target.value) return;
+      this.selDate = parseLocalDate(event.target.value);
+      this.calDate = parseLocalDate(event.target.value);
+      this.render();
+    });
+    scope.querySelectorAll('[data-mobile-day]').forEach(button => {
+      button.addEventListener('click', () => {
+        this.selDate = addDays(this.selDate, Number(button.dataset.mobileDay));
+        this.calDate = new Date(this.selDate);
+        this.render();
+      });
+    });
+    scope.querySelector('[data-mobile-today]')?.addEventListener('click', () => {
+      this.selDate = new Date();
+      this.calDate = new Date();
+      this.render();
+    });
+    scope.querySelectorAll('[data-mobile-mode]').forEach(button => {
+      button.addEventListener('click', () => {
+        this.scheduleMode = button.dataset.mobileMode;
+        document.querySelectorAll('.view-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.mode === this.scheduleMode));
+        this.render();
+      });
+    });
+  },
+
+  renderMobileSimplifiedAgenda(content, stores, times, appointments, occupiedTimes) {
+    const rows = times.map(time => {
+      const atTime = appointments.filter(apt => normalizeTime(apt.time) === time);
+      const canAdd = (['admin', 'optometrist'].includes(DB.profile.role) || DB.profile.store_id) && !occupiedTimes.has(time);
+      return `<tr>
+        <th>${time}</th>
+        <td>
+          ${atTime.length ? atTime.map(apt => {
+            const store = DB.getStore(apt.store_id);
+            const hasNewPrescription = this.hasUnreadPrescriptionForAppointment(apt);
+            return `<button class="mobile-simple-apt ${hasNewPrescription ? 'rx-ready-card' : ''}" type="button" data-apt-id="${apt.id}" style="--store:${store?.color || '#64748b'}">
+              <span><span class="dot" style="background:${store?.color || '#64748b'}"></span>${esc(store?.name || 'Loja')}</span>
+              <strong>${esc(apt.client_name)}</strong>
+            </button>`;
+          }).join('') : (canAdd ? `<button class="mobile-simple-add" type="button" data-store="${DB.profile.role === 'store' ? DB.profile.store_id : stores[0]?.id}" data-time="${time}" title="Agendar"><i class="fas fa-plus"></i></button>` : '<span class="mobile-simple-blocked">Ocupado</span>')}
+        </td>
+      </tr>`;
+    }).join('');
+
+    content.innerHTML = `${this.renderMobileAgendaControls()}
+      <div class="mobile-simple-table-wrap">
+        <table class="mobile-simple-table">
+          <tbody>${rows}</tbody>
+        </table>
+      </div>`;
+    this.bindMobileAgendaControls(content);
+    content.querySelectorAll('[data-apt-id]').forEach(button => {
+      button.addEventListener('click', () => this.openAppointmentDetail(button.dataset.aptId));
+    });
+    content.querySelectorAll('.mobile-simple-add').forEach(button => {
+      button.addEventListener('click', () => this.openAppointmentModal({
+        store_id: button.dataset.store,
+        time: button.dataset.time,
       }));
     });
   },
