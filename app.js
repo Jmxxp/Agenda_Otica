@@ -675,7 +675,7 @@ const DB = {
   async saveClient(payload) {
     const current = payload.id ? this.getClient(payload.id) : null;
     const canSaveCurrentPrescription = ['admin', 'store'].includes(this.profile?.role);
-    const canSaveNewPrescription = this.profile?.role === 'optometrist';
+    const canSaveNewPrescription = ['admin', 'optometrist'].includes(this.profile?.role);
     const nextCurrentPrescription = payload.current_prescription?.trim() || payload.prescription?.trim() || '';
     const currentPrescription = current?.prescription?.trim() || '';
     const currentPrescriptionChanged = (payload.current_prescription !== undefined || payload.prescription !== undefined)
@@ -684,10 +684,6 @@ const DB = {
     const currentNewPrescription = current?.new_prescription?.trim() || '';
     const newPrescriptionChanged = payload.new_prescription !== undefined
       && nextNewPrescription !== currentNewPrescription;
-
-    if (canSaveNewPrescription && payload.new_prescription !== undefined && currentNewPrescription && !nextNewPrescription) {
-      throw new Error('Optometrista pode editar a nova receita, mas nao excluir. Peça ao admin para excluir.');
-    }
 
     const clean = {
       store_id: payload.store_id,
@@ -706,8 +702,12 @@ const DB = {
 
     if (payload.new_prescription !== undefined && canSaveNewPrescription) {
       clean.new_prescription = nextNewPrescription || null;
-      clean.new_prescription_updated_at = newPrescriptionChanged ? new Date().toISOString() : current?.new_prescription_updated_at || null;
-      clean.new_prescription_updated_by = newPrescriptionChanged ? this.user.id : current?.new_prescription_updated_by || null;
+      clean.new_prescription_updated_at = nextNewPrescription
+        ? (newPrescriptionChanged ? new Date().toISOString() : current?.new_prescription_updated_at || null)
+        : null;
+      clean.new_prescription_updated_by = nextNewPrescription
+        ? (newPrescriptionChanged ? this.user.id : current?.new_prescription_updated_by || null)
+        : null;
     }
 
     if (payload.id) {
@@ -749,7 +749,7 @@ const DB = {
   },
 
   async notifyPrescriptionChange(client, prescriptionChanged) {
-    if (!prescriptionChanged || !client?.new_prescription || this.profile?.role !== 'optometrist') return;
+    if (!prescriptionChanged || !client?.new_prescription || !['admin', 'optometrist'].includes(this.profile?.role)) return;
 
     const store = this.getStore(client.store_id);
     const { error } = await this.client
@@ -1800,9 +1800,6 @@ const App = {
           </div>`).join('')}
         </div>
       </div>` : ''}
-      <div class="modal-foot">
-        <button class="btn btn-secondary modal-close" type="button">Fechar</button>
-      </div>
     </div>`);
   },
 
@@ -1937,7 +1934,7 @@ const App = {
     const currentPrescription = parsePrescription(client?.prescription);
     const newPrescription = parsePrescription(client?.new_prescription);
     const canEditCurrentPrescription = canEdit && ['admin', 'store'].includes(DB.profile.role);
-    const canEditNewPrescription = canEdit && DB.profile.role === 'optometrist';
+    const canEditNewPrescription = canEdit && ['admin', 'optometrist'].includes(DB.profile.role);
     const canDeleteNewPrescription = Boolean(client?.id && client?.new_prescription && DB.profile.role === 'admin');
 
     this.openModal(`<div class="modal-head">
@@ -2056,7 +2053,7 @@ const App = {
     const currentPrescription = parsePrescription(client?.prescription);
     const newPrescription = parsePrescription(client?.new_prescription);
     const canEditCurrentPrescription = ['admin', 'store'].includes(DB.profile.role);
-    const canEditNewPrescription = DB.profile.role === 'optometrist';
+    const canEditNewPrescription = ['admin', 'optometrist'].includes(DB.profile.role);
     const canDeleteClient = Boolean(client && DB.profile.role === 'admin');
     const canDeleteNewPrescription = Boolean(client?.id && client?.new_prescription && DB.profile.role === 'admin');
 

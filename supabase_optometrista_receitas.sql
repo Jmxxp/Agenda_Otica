@@ -236,8 +236,8 @@ begin
   v_role := app_private.current_profile_role();
 
   if tg_op = 'INSERT' then
-    if new.new_prescription is not null and v_role <> 'optometrist' then
-      raise exception 'Apenas optometrista pode preencher a nova receita';
+    if new.new_prescription is not null and v_role not in ('optometrist', 'admin') then
+      raise exception 'Apenas optometrista ou admin pode preencher a nova receita';
     end if;
 
     if new.prescription is not null and v_role = 'optometrist' then
@@ -246,8 +246,8 @@ begin
   end if;
 
   if tg_op = 'UPDATE' then
-    if new.new_prescription is distinct from old.new_prescription and v_role <> 'optometrist' then
-      raise exception 'Apenas optometrista pode alterar a nova receita';
+    if new.new_prescription is distinct from old.new_prescription and v_role not in ('optometrist', 'admin') then
+      raise exception 'Apenas optometrista ou admin pode alterar a nova receita';
     end if;
 
     if new.prescription is distinct from old.prescription and v_role = 'optometrist' then
