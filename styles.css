@@ -1194,7 +1194,7 @@ label { display: grid; gap: 7px; color: var(--text2); font-size: .82rem; font-we
   position: sticky;
   bottom: 0;
   z-index: 4;
-  display: flex;
+  display: none;
   justify-content: flex-end;
   gap: 8px;
   width: fit-content;
@@ -2913,10 +2913,28 @@ textarea {
     min-height: 30px;
   }
 
+  .modal-box.prescription-modal .rx-toggle {
+    order: 1;
+  }
+
+  .modal-box.prescription-modal .rx-panel {
+    order: 3;
+  }
+
   .modal-box.prescription-modal .rx-sign-toolbar {
+    position: sticky;
+    top: 6px;
+    order: 2;
+    z-index: 6;
+    display: flex;
     justify-content: center;
     width: 100%;
+    margin: 2px 0 4px;
     padding: 8px;
+  }
+
+  .modal-box.prescription-modal .rx-sign-toolbar.hidden {
+    display: none;
   }
 
   .modal-box.prescription-modal .rx-sign-toolbar button {

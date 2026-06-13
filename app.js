@@ -2882,15 +2882,26 @@ const App = {
     scope.querySelectorAll('.rx-input').forEach(input => {
       input.addEventListener('focus', () => showToolbarFor(input));
       input.addEventListener('click', () => showToolbarFor(input));
+      input.addEventListener('beforeinput', event => {
+        if (!signedFields.has(input.dataset.rxField) || event.data !== ',') return;
+        event.preventDefault();
+        applySign(input, '-');
+      });
       input.addEventListener('keydown', event => {
         const key = event.key.toLowerCase();
+        if (signedFields.has(input.dataset.rxField) && key === ',') {
+          event.preventDefault();
+          applySign(input, '-');
+          return;
+        }
         if (!['p', '=', 'n'].includes(key)) return;
         event.preventDefault();
         const sign = key === 'n' ? '-' : '+';
         applySign(input, sign);
       });
-      input.addEventListener('input', () => {
-        input.value = formatPrescriptionInput(input.value, input.dataset.rxField);
+      input.addEventListener('input', event => {
+        const forcedSign = signedFields.has(input.dataset.rxField) && event.data === ',' ? '-' : '';
+        input.value = formatPrescriptionInput(input.value, input.dataset.rxField, forcedSign);
       });
     });
 
@@ -3115,12 +3126,31 @@ function serializePrescription(prescription) {
   return JSON.stringify(prescription);
 }
 
-function formatPrescriptionInput(value, field) {
-  const clean = String(value || '').replace(/[^0-9+\-.,/ ]/g, '');
+function formatPrescriptionInput(value, field, forcedSign = '') {
+  const raw = String(value || '');
+
+  if (field === 'axis') {
+    const digits = raw.replace(/\D/g, '');
+    return digits ? `${digits}\u00B0` : '';
+  }
+
+  if (field === 'dnp') {
+    const digits = raw.replace(/\D/g, '');
+    if (!digits) return '';
+    if (digits.length === 1) return digits;
+    return `${digits.slice(0, 2)},${digits.slice(2)}`;
+  }
+
+  const clean = raw.replace(/[^0-9+\-.,/ ]/g, '');
   if (!['spherical', 'cylindrical', 'addition'].includes(field)) return clean;
 
-  const sign = clean.trim().startsWith('-') ? '-' : clean.trim().startsWith('+') ? '+' : '';
+  const trimmed = clean.trim();
+  if (!trimmed) return '';
+
+  const hasExplicitSign = /^[+\-,]/.test(trimmed);
+  const sign = forcedSign === '-' || trimmed.startsWith('-') || trimmed.startsWith(',') ? '-' : '+';
   const digits = clean.replace(/\D/g, '');
+  if (!digits) return hasExplicitSign || forcedSign ? sign : '';
   if (digits.length <= 2) return `${sign}${digits}`;
 
   const integer = String(Number(digits.slice(0, -2)));
