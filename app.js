@@ -2257,6 +2257,10 @@ const App = {
         </div>` : ''}
         ${permissions.newDeletable ? '<button class="btn btn-danger rx-delete-new-prescription" type="button" data-delete-new-prescription><i class="fas fa-trash"></i> Excluir nova receita</button>' : ''}
       </div>
+      <div class="rx-sign-toolbar hidden" data-rx-sign-toolbar aria-label="Sinal da receita">
+        <button type="button" data-rx-sign="+" title="Adicionar sinal positivo">+</button>
+        <button type="button" data-rx-sign="-" title="Adicionar sinal negativo">-</button>
+      </div>
     </fieldset>`;
   },
 
@@ -2858,18 +2862,46 @@ const App = {
   },
 
   bindPrescriptionInputs(scope) {
+    const toolbar = scope.querySelector('[data-rx-sign-toolbar]');
+    const signedFields = new Set(['spherical', 'cylindrical', 'addition']);
+    let activeInput = null;
+    const showToolbarFor = input => {
+      activeInput = input;
+      const shouldShow = Boolean(toolbar && input && !input.disabled && signedFields.has(input.dataset.rxField));
+      toolbar?.classList.toggle('hidden', !shouldShow);
+    };
+    const applySign = (input, sign) => {
+      if (!input || input.disabled) return;
+      const value = input.value.trim();
+      input.value = value ? `${sign}${value.replace(/^[+-]/, '')}` : sign;
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.focus({ preventScroll: true });
+      input.setSelectionRange(input.value.length, input.value.length);
+    };
+
     scope.querySelectorAll('.rx-input').forEach(input => {
+      input.addEventListener('focus', () => showToolbarFor(input));
+      input.addEventListener('click', () => showToolbarFor(input));
       input.addEventListener('keydown', event => {
         const key = event.key.toLowerCase();
         if (!['p', '=', 'n'].includes(key)) return;
         event.preventDefault();
         const sign = key === 'n' ? '-' : '+';
-        input.setRangeText(sign, input.selectionStart, input.selectionEnd, 'end');
-        input.dispatchEvent(new Event('input', { bubbles: true }));
+        applySign(input, sign);
       });
       input.addEventListener('input', () => {
         input.value = formatPrescriptionInput(input.value, input.dataset.rxField);
       });
+    });
+
+    toolbar?.querySelectorAll('[data-rx-sign]').forEach(button => {
+      button.addEventListener('pointerdown', event => event.preventDefault());
+      button.addEventListener('click', () => applySign(activeInput, button.dataset.rxSign));
+    });
+    scope.addEventListener('focusout', () => {
+      setTimeout(() => {
+        if (!scope.querySelector('.rx-input:focus')) toolbar?.classList.add('hidden');
+      }, 0);
     });
   },
 
