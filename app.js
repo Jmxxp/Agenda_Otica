@@ -2863,7 +2863,7 @@ const App = {
 
   bindPrescriptionInputs(scope) {
     const toolbar = scope.querySelector('[data-rx-sign-toolbar]');
-    const signedFields = new Set(['spherical', 'cylindrical', 'addition']);
+    const signedFields = new Set(['spherical', 'cylindrical']);
     let activeInput = null;
     const showToolbarFor = input => {
       activeInput = input;
@@ -2901,7 +2901,7 @@ const App = {
       });
       input.addEventListener('input', event => {
         const forcedSign = signedFields.has(input.dataset.rxField) && event.data === ',' ? '-' : '';
-        input.value = formatPrescriptionInput(input.value, input.dataset.rxField, forcedSign);
+        input.value = formatPrescriptionInput(input.value, input.dataset.rxField, forcedSign, event.inputType);
       });
     });
 
@@ -3126,12 +3126,13 @@ function serializePrescription(prescription) {
   return JSON.stringify(prescription);
 }
 
-function formatPrescriptionInput(value, field, forcedSign = '') {
+function formatPrescriptionInput(value, field, forcedSign = '', inputType = '') {
   const raw = String(value || '');
 
   if (field === 'axis') {
     const digits = raw.replace(/\D/g, '');
-    return digits ? `${digits}\u00B0` : '';
+    const nextDigits = inputType.startsWith('delete') && !raw.includes('\u00B0') ? digits.slice(0, -1) : digits;
+    return nextDigits ? `${nextDigits}\u00B0` : '';
   }
 
   if (field === 'dnp') {
@@ -3148,7 +3149,7 @@ function formatPrescriptionInput(value, field, forcedSign = '') {
   if (!trimmed) return '';
 
   const hasExplicitSign = /^[+\-,]/.test(trimmed);
-  const sign = forcedSign === '-' || trimmed.startsWith('-') || trimmed.startsWith(',') ? '-' : '+';
+  const sign = field === 'addition' ? '+' : forcedSign === '-' || trimmed.startsWith('-') || trimmed.startsWith(',') ? '-' : '+';
   const digits = clean.replace(/\D/g, '');
   if (!digits) return hasExplicitSign || forcedSign ? sign : '';
   if (digits.length <= 2) return `${sign}${digits}`;
