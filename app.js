@@ -3137,7 +3137,7 @@ function formatPrescriptionInput(value, field, forcedSign = '') {
   if (field === 'dnp') {
     const digits = raw.replace(/\D/g, '');
     if (!digits) return '';
-    if (digits.length === 1) return digits;
+    if (digits.length <= 2) return digits;
     return `${digits.slice(0, 2)},${digits.slice(2)}`;
   }
 
