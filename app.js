@@ -129,11 +129,13 @@ const DB = {
   },
 
   async refresh() {
-    const [profile, storesRes, appointmentsRes, clientsRes, optometrists] = await Promise.all([
-      this.user ? this.getProfile() : Promise.resolve(null),
-      this.client.from('stores').select('*').order('name', { ascending: true }),
-      this.client.from('appointments').select('*').order('date', { ascending: true }).order('time', { ascending: true }),
-      this.client.from('clients').select('*').order('name', { ascending: true }),
+    const profile = this.user ? await this.getProfile() : null;
+    if (profile) this.profile = profile;
+
+    const [storesRes, appointmentsRes, clientsRes, optometrists] = await Promise.all([
+      this.storesQuery(),
+      this.appointmentsQuery(),
+      this.clientsQuery(),
       this.loadOptometrists(),
     ]);
 
@@ -141,7 +143,6 @@ const DB = {
     if (appointmentsRes.error) throw appointmentsRes.error;
     if (clientsRes.error) throw clientsRes.error;
 
-    if (profile) this.profile = profile;
     this.stores = storesRes.data || [];
     this.optometrists = optometrists || [];
     this.appointments = appointmentsRes.data || [];
@@ -150,6 +151,34 @@ const DB = {
     this.appointmentNotifications = await this.loadAppointmentNotifications();
     this.lastSync = new Date();
     return true;
+  },
+
+  storesQuery() {
+    return this.client
+      .from('stores')
+      .select('*')
+      .order('name', { ascending: true });
+  },
+
+  appointmentsQuery() {
+    return this.client
+      .from('appointments')
+      .select('*')
+      .order('date', { ascending: true })
+      .order('time', { ascending: true });
+  },
+
+  clientsQuery() {
+    let query = this.client
+      .from('clients')
+      .select('*')
+      .order('name', { ascending: true });
+
+    if (this.profile?.role === 'store') {
+      query = query.eq('store_id', this.profile.store_id || emptyUuid());
+    }
+
+    return query;
   },
 
   async loadOptometrists() {
@@ -280,14 +309,29 @@ const DB = {
     });
     this.authSubscription = authData.subscription;
 
-    const tables = ['stores', 'profiles', 'clients', 'appointments'];
-    if (this.prescriptionNotificationsAvailable) tables.push('prescription_notifications');
-    if (this.appointmentNotificationsAvailable) tables.push('appointment_notifications');
+    const storeFilterId = this.profile?.role === 'store' ? (this.profile.store_id || emptyUuid()) : null;
+    const storeFilter = column => storeFilterId ? `${column}=eq.${storeFilterId}` : null;
+    const profileFilter = this.profile?.role === 'store' ? `id=eq.${this.user?.id || emptyUuid()}` : null;
+    const tableChanges = [
+      { table: 'stores', filter: null },
+      { table: 'profiles', filter: profileFilter },
+      { table: 'clients', filter: storeFilter('store_id') },
+      { table: 'appointments', filter: null },
+    ];
+    if (this.prescriptionNotificationsAvailable) {
+      tableChanges.push({ table: 'prescription_notifications', filter: storeFilter('store_id') });
+    }
+    if (this.appointmentNotificationsAvailable) {
+      tableChanges.push({ table: 'appointment_notifications', filter: storeFilter('store_id') });
+    }
+
     let channel = this.client.channel(`agenda-realtime-${this.user?.id || Date.now()}`);
-    tables.forEach(table => {
+    tableChanges.forEach(({ table, filter }) => {
+      const changes = { event: '*', schema: 'public', table };
+      if (filter) changes.filter = filter;
       channel = channel.on(
         'postgres_changes',
-        { event: '*', schema: 'public', table },
+        changes,
         payload => {
           this.handleRealtimePayload(table, payload);
           this.queueRealtimeRefresh();
@@ -1024,10 +1068,11 @@ const App = {
   authMode: 'login',
   activeView: 'agenda',
   scheduleMode: 'grid',
-  clientsScope: 'own',
   today: new Date(),
   selDate: new Date(),
   calDate: new Date(),
+  currentDateKey: null,
+  dateRolloverTimer: null,
   audioContext: null,
   audioUnlocked: false,
   notificationSoundId: localStorage.getItem(SOUND_PREF_KEY) || 'bell',
@@ -1055,6 +1100,7 @@ const App = {
   },
 
   showLogin() {
+    this.stopDateRollover();
     document.getElementById('loading').classList.add('hidden');
     document.getElementById('login').classList.remove('hidden');
     document.getElementById('app').classList.add('hidden');
@@ -1071,6 +1117,7 @@ const App = {
       el.classList.toggle('hidden', DB.profile.role !== 'admin');
     });
     this.bindAppEvents();
+    this.startDateRollover();
     DB.startSync().catch(err => {
       DB.connected = false;
       DB.realtimeStatus = 'offline';
@@ -1078,6 +1125,42 @@ const App = {
       this.toast(`Realtime: ${err.message}`, 'error');
     });
     this.render();
+  },
+
+  startDateRollover() {
+    this.stopDateRollover();
+    this.today = new Date();
+    this.selDate = new Date(this.today);
+    this.calDate = new Date(this.today);
+    this.currentDateKey = this.fmtDate(this.today);
+    this.dateRolloverTimer = setInterval(() => this.syncCurrentDate(), 30000);
+  },
+
+  stopDateRollover() {
+    if (!this.dateRolloverTimer) return;
+    clearInterval(this.dateRolloverTimer);
+    this.dateRolloverTimer = null;
+  },
+
+  syncCurrentDate() {
+    const now = new Date();
+    const nextDateKey = this.fmtDate(now);
+    this.today = now;
+
+    if (!this.currentDateKey) {
+      this.currentDateKey = nextDateKey;
+      return;
+    }
+
+    if (nextDateKey === this.currentDateKey) return;
+
+    this.currentDateKey = nextDateKey;
+    this.selDate = new Date(now);
+    this.calDate = new Date(now);
+
+    if (!document.getElementById('app')?.classList.contains('hidden')) {
+      this.render();
+    }
   },
 
   bindAuth() {
@@ -1142,6 +1225,10 @@ const App = {
     });
     document.addEventListener('pointerdown', () => this.unlockNotificationAudio(), { once: true });
     document.addEventListener('touchstart', () => this.unlockNotificationAudio(), { once: true });
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) this.syncCurrentDate();
+    });
+    window.addEventListener('focus', () => this.syncCurrentDate());
 
     let resizeTimer = null;
     window.addEventListener('resize', () => {
@@ -1220,6 +1307,7 @@ const App = {
   },
 
   async logout() {
+    this.stopDateRollover();
     await DB.signOut();
     this._appEventsBound = false;
     this.showLogin();
@@ -1693,8 +1781,7 @@ const App = {
   },
 
   renderClients() {
-    const canToggleAll = DB.profile.role === 'store';
-    const showingAll = ['admin', 'optometrist'].includes(DB.profile.role) || this.clientsScope === 'all';
+    const showingAll = ['admin', 'optometrist'].includes(DB.profile.role);
     const clients = showingAll
       ? this.getVisibleClientsForAllStores()
       : DB.clients.filter(client => client.store_id === DB.profile.store_id);
@@ -1704,7 +1791,6 @@ const App = {
         <p>${showingAll ? 'Todos os clientes com etiquetas por loja.' : 'Clientes da loja logada.'}</p>
       </div>
       <div class="toolbar-actions">
-        ${canToggleAll ? `<button class="btn btn-secondary" id="toggle-clients"><i class="fas fa-tags"></i> ${showingAll ? 'Minha loja' : 'Todos'}</button>` : ''}
         <button class="btn btn-primary" id="new-client"><i class="fas fa-user-plus"></i> Cliente</button>
       </div>
     </div>
@@ -1722,19 +1808,6 @@ const App = {
     </div>` : this.emptyState('fa-user-group', 'Nenhum cliente ainda', 'Cadastre clientes avulsos ou crie um agendamento.')}`;
 
     document.getElementById('content').innerHTML = html;
-    document.getElementById('toggle-clients')?.addEventListener('click', async () => {
-      const nextScope = this.clientsScope === 'all' ? 'own' : 'all';
-      if (nextScope === 'all') {
-        try {
-          await DB.refresh();
-        } catch (err) {
-          this.toast(err.message, 'error');
-          return;
-        }
-      }
-      this.clientsScope = nextScope;
-      this.renderClients();
-    });
     document.getElementById('new-client').onclick = () => this.openClientModal();
     document.querySelectorAll('[data-client-id]').forEach(row => {
       row.addEventListener('click', () => {
@@ -2036,14 +2109,24 @@ const App = {
       || DB.clients.find(row => row.store_id === apt.store_id && row.phone === apt.client_phone)
       || null;
     const canEdit = DB.canManageStore(apt.store_id);
+    const canViewPrescription = Boolean(client && DB.canManageStore(client.store_id));
     const currentTime = normalizeTime(apt.time);
     const times = this.getAvailableAppointmentTimes(apt.date, apt.id);
     if (!times.includes(currentTime)) times.push(currentTime);
-    const currentPrescription = parsePrescription(client?.prescription);
-    const newPrescription = parsePrescription(client?.new_prescription);
-    const canEditCurrentPrescription = canEdit && ['admin', 'store'].includes(DB.profile.role);
-    const canEditNewPrescription = canEdit && ['admin', 'optometrist'].includes(DB.profile.role);
-    const canDeleteNewPrescription = Boolean(client?.id && client?.new_prescription && DB.profile.role === 'admin');
+    const currentPrescription = canViewPrescription ? parsePrescription(client?.prescription) : emptyPrescription();
+    const newPrescription = canViewPrescription ? parsePrescription(client?.new_prescription) : emptyPrescription();
+    const canEditCurrentPrescription = canViewPrescription && canEdit && ['admin', 'store'].includes(DB.profile.role);
+    const canEditNewPrescription = canViewPrescription && canEdit && ['admin', 'optometrist'].includes(DB.profile.role);
+    const canDeleteNewPrescription = Boolean(canViewPrescription && client?.id && client?.new_prescription && DB.profile.role === 'admin');
+    const prescriptionSection = canViewPrescription
+      ? this.renderPrescriptionSection(currentPrescription, newPrescription, {
+        currentEditable: canEditCurrentPrescription,
+        newEditable: canEditNewPrescription,
+        newDeletable: canDeleteNewPrescription,
+        clientId: client?.id,
+        printEnabled: true,
+      })
+      : '';
 
     this.openModal(`<div class="modal-head">
       <h3>${canEdit ? 'Editar' : 'Visualizar'} agendamento</h3>
@@ -2070,13 +2153,7 @@ const App = {
       <label>Observacoes
         <textarea id="apt-notes" ${canEdit ? '' : 'disabled'}>${esc(apt.notes || '')}</textarea>
       </label>
-      ${this.renderPrescriptionSection(currentPrescription, newPrescription, {
-        currentEditable: canEditCurrentPrescription,
-        newEditable: canEditNewPrescription,
-        newDeletable: canDeleteNewPrescription,
-        clientId: client?.id,
-        printEnabled: Boolean(client),
-      })}
+      ${prescriptionSection}
       <div class="modal-foot appointment-actions">
         <button class="btn btn-whatsapp" type="button" id="whatsapp"><i class="fab fa-whatsapp"></i> WhatsApp</button>
         ${canEdit ? '<button class="btn btn-danger" type="button" id="delete-apt"><i class="fas fa-trash"></i> Excluir</button>' : ''}
@@ -3007,6 +3084,10 @@ function nickToAuthEmail(nick) {
 
 function normalizeTime(value) {
   return String(value || '').slice(0, 5);
+}
+
+function emptyUuid() {
+  return '00000000-0000-0000-0000-000000000000';
 }
 
 function parseMinutes(value) {

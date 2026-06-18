@@ -1,6 +1,6 @@
--- Permite que logins de loja vejam todas as lojas na Agenda Geral
--- e clientes/etiquetas de todas as lojas na tela "Todos".
--- Insert/update/delete continuam restritos pelas politicas ja existentes.
+-- Permite que logins de loja vejam todas as lojas e agendamentos
+-- na Agenda Geral, mas nao libera o cadastro completo de clientes
+-- de outra loja porque as receitas ficam na tabela public.clients.
 
 alter table public.stores enable row level security;
 alter table public.clients enable row level security;
@@ -16,7 +16,7 @@ on public.stores
 for select
 to authenticated
 using (
-  app_private.current_profile_role() in ('admin', 'optometrist', 'store')
+  (select app_private.current_profile_role()) in ('admin', 'optometrist', 'store')
 );
 
 drop policy if exists "clients_select_admin_optometrist_or_own_store" on public.clients;
@@ -25,7 +25,8 @@ on public.clients
 for select
 to authenticated
 using (
-  app_private.current_profile_role() in ('admin', 'optometrist', 'store')
+  (select app_private.current_profile_role()) in ('admin', 'optometrist')
+  or store_id = (select app_private.current_profile_store_id())
 );
 
 drop policy if exists "appointments_select_admin_optometrist_or_own_store" on public.appointments;
@@ -34,5 +35,5 @@ on public.appointments
 for select
 to authenticated
 using (
-  app_private.current_profile_role() in ('admin', 'optometrist', 'store')
+  (select app_private.current_profile_role()) in ('admin', 'optometrist', 'store')
 );
