@@ -13,6 +13,8 @@ const SOUND_PREF_KEY = 'otica_prescription_sound';
 const SOUND_MUTED_KEY = 'otica_prescription_sound_muted';
 const LOCAL_APPOINTMENT_NOTIFICATIONS_KEY = 'otica_appointment_notifications';
 const APPOINTMENT_NOTIFICATIONS_DISABLED_KEY = 'otica_appointment_notifications_disabled';
+const REALTIME_FALLBACK_REFRESH_MS = 30000;
+const REALTIME_RECONNECT_MS = 2500;
 const NOTIFICATION_SOUNDS = [
   { id: 'rotating-bell', label: 'Sininho giratorio', src: 'assets/sounds/rotating-bicycle-bell.wav' },
   { id: 'ding-dong', label: 'Ding dong', src: 'assets/sounds/ding-dong-bicycle-bell.ogg' },
@@ -45,6 +47,9 @@ const DB = {
   timer: null,
   realtimeChannel: null,
   realtimeDebounce: null,
+  realtimeReconnectTimer: null,
+  realtimeReconnectEnabled: false,
+  realtimeRunId: 0,
   realtimeStatus: 'offline',
   refreshInFlight: null,
   authSubscription: null,
@@ -125,6 +130,8 @@ const DB = {
     this.appointments = [];
     this.prescriptionNotifications = [];
     this.appointmentNotifications = [];
+    this.prescriptionNotificationsAvailable = true;
+    this.appointmentNotificationsAvailable = localStorage.getItem(APPOINTMENT_NOTIFICATIONS_DISABLED_KEY) !== '1';
     if (this.client) await this.client.auth.signOut();
   },
 
@@ -295,6 +302,8 @@ const DB = {
     this.stopSync();
     if (!this.client) return;
 
+    const runId = ++this.realtimeRunId;
+    this.realtimeReconnectEnabled = true;
     this.realtimeStatus = 'connecting';
     this.connected = true;
     App.updateConnStatus?.();
@@ -340,6 +349,8 @@ const DB = {
     });
 
     this.realtimeChannel = channel.subscribe((status, err) => {
+      if (runId !== this.realtimeRunId || !this.realtimeReconnectEnabled) return;
+
       if (status === 'SUBSCRIBED') {
         this.realtimeStatus = 'online';
         this.connected = true;
@@ -352,8 +363,62 @@ const DB = {
         this.connected = false;
         App.updateConnStatus?.();
         if (err) App.toast(`Realtime: ${err.message || status}`, 'error');
+        this.scheduleRealtimeReconnect();
       }
     });
+
+    this.timer = setInterval(() => {
+      if (!this.user || document.hidden) return;
+      this.queueRealtimeRefresh();
+    }, REALTIME_FALLBACK_REFRESH_MS);
+  },
+
+  scheduleRealtimeReconnect() {
+    if (!this.realtimeReconnectEnabled || !this.client || !this.user || this.realtimeReconnectTimer) return;
+    this.realtimeReconnectTimer = setTimeout(() => {
+      this.realtimeReconnectTimer = null;
+      if (!this.realtimeReconnectEnabled || !this.user) return;
+      this.startSync().catch(err => {
+        this.realtimeStatus = 'offline';
+        this.connected = false;
+        App.updateConnStatus?.();
+        App.toast(`Realtime: ${err.message}`, 'error');
+        this.scheduleRealtimeReconnect();
+      });
+    }, REALTIME_RECONNECT_MS);
+  },
+
+  applyPrescriptionNotificationRealtime(payload) {
+    if (this.profile?.role !== 'store') return false;
+
+    if (payload.eventType === 'DELETE') {
+      const removedId = payload.old?.id;
+      if (!removedId) return false;
+      const before = this.prescriptionNotifications.length;
+      this.prescriptionNotifications = this.prescriptionNotifications
+        .filter(item => String(item.id) !== String(removedId));
+      return before !== this.prescriptionNotifications.length;
+    }
+
+    const notification = payload.new;
+    if (!notification?.id || notification.store_id !== this.profile.store_id) return false;
+    this.prescriptionNotificationsAvailable = true;
+
+    const existingIndex = this.prescriptionNotifications
+      .findIndex(item => String(item.id) === String(notification.id));
+    if (existingIndex >= 0) {
+      this.prescriptionNotifications[existingIndex] = {
+        ...this.prescriptionNotifications[existingIndex],
+        ...notification,
+      };
+    } else {
+      this.prescriptionNotifications.unshift(notification);
+    }
+
+    this.prescriptionNotifications = this.prescriptionNotifications
+      .sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0))
+      .slice(0, 30);
+    return true;
   },
 
   handleRealtimePayload(table, payload) {
@@ -367,10 +432,13 @@ const DB = {
 
     if (
       table === 'prescription_notifications'
-      && payload.eventType === 'INSERT'
-      && payload.new?.store_id === this.profile.store_id
+      && this.applyPrescriptionNotificationRealtime(payload)
     ) {
-      this.toastPrescriptionRealtime(payload.new.client_id || payload.new.id);
+      App.updatePrescriptionNotifications?.();
+      App.renderPrescriptionRealtimeAlerts?.();
+      if (payload.eventType === 'INSERT' && !payload.new?.read_at) {
+        this.toastPrescriptionRealtime(payload.new.client_id || payload.new.id);
+      }
       return;
     }
 
@@ -445,10 +513,14 @@ const DB = {
   },
 
   stopSync() {
+    this.realtimeReconnectEnabled = false;
+    this.realtimeRunId += 1;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
     if (this.realtimeDebounce) clearTimeout(this.realtimeDebounce);
     this.realtimeDebounce = null;
+    if (this.realtimeReconnectTimer) clearTimeout(this.realtimeReconnectTimer);
+    this.realtimeReconnectTimer = null;
     if (this.realtimeChannel) {
       this.client?.removeChannel(this.realtimeChannel);
       this.realtimeChannel = null;
@@ -1226,9 +1298,15 @@ const App = {
     document.addEventListener('pointerdown', () => this.unlockNotificationAudio(), { once: true });
     document.addEventListener('touchstart', () => this.unlockNotificationAudio(), { once: true });
     document.addEventListener('visibilitychange', () => {
-      if (!document.hidden) this.syncCurrentDate();
+      if (!document.hidden) {
+        this.syncCurrentDate();
+        this.refreshVisibleData();
+      }
     });
-    window.addEventListener('focus', () => this.syncCurrentDate());
+    window.addEventListener('focus', () => {
+      this.syncCurrentDate();
+      this.refreshVisibleData();
+    });
 
     let resizeTimer = null;
     window.addEventListener('resize', () => {
@@ -1240,6 +1318,21 @@ const App = {
         if (!document.getElementById('app')?.classList.contains('hidden')) this.render();
       }, 140);
     });
+  },
+
+  refreshVisibleData() {
+    if (!DB.user || document.getElementById('app')?.classList.contains('hidden')) return;
+
+    if (DB.realtimeStatus === 'offline') {
+      DB.startSync().catch(err => {
+        DB.connected = false;
+        DB.realtimeStatus = 'offline';
+        this.updateConnStatus();
+        this.toast(`Realtime: ${err.message}`, 'error');
+      });
+    }
+
+    DB.queueRealtimeRefresh();
   },
 
   bindAppEvents() {
