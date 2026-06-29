@@ -1731,14 +1731,16 @@ const App = {
 
   renderEntryAuthorizedCenter(notification) {
     const card = document.createElement('div');
+    const clientName = notification.client_name || 'Cliente';
+    const message = cleanAppointmentNotificationMessage(notification);
     card.className = 'entry-response-center';
     card.role = 'alertdialog';
     card.setAttribute('aria-modal', 'false');
     card.innerHTML = `<div class="entry-response-center-card">
       <div class="entry-response-center-icon"><i class="fas fa-door-open"></i></div>
-      <span>Entrada autorizada</span>
-      <h3>Cliente deve subir</h3>
-      <p>${esc(cleanAppointmentNotificationMessage(notification))}</p>
+      <span>Atendimento liberado</span>
+      <h3>Entrada autorizada</h3>
+      <p><strong>${esc(clientName)}</strong>${message ? ` <small>${esc(message.replace(clientName, '').trim())}</small>` : ''}</p>
       <button class="btn btn-primary" type="button" data-entry-response-ack>Entendido</button>
     </div>`;
 
