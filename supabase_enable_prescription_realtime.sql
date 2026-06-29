@@ -31,6 +31,32 @@ grant usage on schema app_private to authenticated;
 grant execute on function app_private.current_profile_role() to authenticated;
 grant execute on function app_private.current_profile_store_id() to authenticated;
 
+create table if not exists public.appointment_notifications (
+  id uuid primary key default gen_random_uuid(),
+  store_id uuid not null references public.stores(id) on delete cascade,
+  appointment_id uuid,
+  client_id uuid references public.clients(id) on delete set null,
+  client_name text,
+  appointment_date date,
+  appointment_time time,
+  message text not null,
+  read_at timestamptz,
+  created_by uuid references auth.users(id),
+  created_at timestamptz not null default now()
+);
+
+alter table public.appointment_notifications
+  add column if not exists store_id uuid references public.stores(id) on delete cascade,
+  add column if not exists appointment_id uuid,
+  add column if not exists client_id uuid references public.clients(id) on delete set null,
+  add column if not exists client_name text,
+  add column if not exists appointment_date date,
+  add column if not exists appointment_time time,
+  add column if not exists message text,
+  add column if not exists read_at timestamptz,
+  add column if not exists created_by uuid references auth.users(id),
+  add column if not exists created_at timestamptz not null default now();
+
 do $$
 begin
   if to_regclass('public.clients') is not null then
@@ -200,3 +226,5 @@ begin
     end if;
   end if;
 end $$;
+
+notify pgrst, 'reload schema';

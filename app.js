@@ -1025,7 +1025,7 @@ const DB = {
     if (isMissingTableError(error)) {
       this.appointmentNotificationsAvailable = false;
       localStorage.setItem(APPOINTMENT_NOTIFICATIONS_DISABLED_KEY, '1');
-      throw new Error('A tabela appointment_notifications precisa estar ativa no Supabase para solicitar entrada.');
+      throw new Error('Execute supabase_enable_entry_requests.sql no Supabase para ativar a tabela appointment_notifications.');
     }
     if (error) throw error;
     this.appointmentNotificationsAvailable = true;
@@ -1075,7 +1075,7 @@ const DB = {
     if (isMissingTableError(error)) {
       this.appointmentNotificationsAvailable = false;
       localStorage.setItem(APPOINTMENT_NOTIFICATIONS_DISABLED_KEY, '1');
-      throw new Error('A tabela appointment_notifications precisa estar ativa no Supabase para responder.');
+      throw new Error('Execute supabase_enable_entry_requests.sql no Supabase para ativar a tabela appointment_notifications.');
     }
     if (error) throw error;
     this.appointmentNotificationsAvailable = true;

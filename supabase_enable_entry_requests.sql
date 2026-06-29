@@ -1,0 +1,134 @@
+-- Execute no SQL Editor do Supabase para ativar "Solicitar entrada".
+-- Cria appointment_notifications quando ela ainda nao existe e libera realtime/RLS.
+
+create schema if not exists app_private;
+
+create or replace function app_private.current_profile_role()
+returns text
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select role::text
+  from public.profiles
+  where id = auth.uid()
+$$;
+
+create or replace function app_private.current_profile_store_id()
+returns uuid
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select store_id
+  from public.profiles
+  where id = auth.uid()
+$$;
+
+grant usage on schema app_private to authenticated;
+grant execute on function app_private.current_profile_role() to authenticated;
+grant execute on function app_private.current_profile_store_id() to authenticated;
+
+create table if not exists public.appointment_notifications (
+  id uuid primary key default gen_random_uuid(),
+  store_id uuid not null references public.stores(id) on delete cascade,
+  appointment_id uuid,
+  client_id uuid references public.clients(id) on delete set null,
+  client_name text,
+  appointment_date date,
+  appointment_time time,
+  message text not null,
+  read_at timestamptz,
+  created_by uuid references auth.users(id),
+  created_at timestamptz not null default now()
+);
+
+alter table public.appointment_notifications
+  add column if not exists store_id uuid references public.stores(id) on delete cascade,
+  add column if not exists appointment_id uuid,
+  add column if not exists client_id uuid references public.clients(id) on delete set null,
+  add column if not exists client_name text,
+  add column if not exists appointment_date date,
+  add column if not exists appointment_time time,
+  add column if not exists message text,
+  add column if not exists read_at timestamptz,
+  add column if not exists created_by uuid references auth.users(id),
+  add column if not exists created_at timestamptz not null default now();
+
+alter table public.appointment_notifications enable row level security;
+grant select, insert, update, delete on table public.appointment_notifications to authenticated;
+alter table public.appointment_notifications replica identity full;
+
+drop policy if exists "appointment_notifications_store_select_own" on public.appointment_notifications;
+create policy "appointment_notifications_store_select_own"
+on public.appointment_notifications
+for select
+to authenticated
+using (
+  (select app_private.current_profile_role()) in ('admin', 'optometrist')
+  or (
+    (select app_private.current_profile_role()) = 'store'
+    and store_id = (select app_private.current_profile_store_id())
+  )
+);
+
+drop policy if exists "appointment_notifications_insert_allowed" on public.appointment_notifications;
+create policy "appointment_notifications_insert_allowed"
+on public.appointment_notifications
+for insert
+to authenticated
+with check (
+  (select app_private.current_profile_role()) in ('admin', 'optometrist')
+  or store_id = (select app_private.current_profile_store_id())
+);
+
+drop policy if exists "appointment_notifications_store_update_own" on public.appointment_notifications;
+create policy "appointment_notifications_store_update_own"
+on public.appointment_notifications
+for update
+to authenticated
+using (
+  (select app_private.current_profile_role()) = 'store'
+  and store_id = (select app_private.current_profile_store_id())
+)
+with check (
+  (select app_private.current_profile_role()) = 'store'
+  and store_id = (select app_private.current_profile_store_id())
+);
+
+drop policy if exists "appointment_notifications_store_delete_own" on public.appointment_notifications;
+create policy "appointment_notifications_store_delete_own"
+on public.appointment_notifications
+for delete
+to authenticated
+using (
+  (select app_private.current_profile_role()) = 'store'
+  and store_id = (select app_private.current_profile_store_id())
+);
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_publication_tables
+    where pubname = 'supabase_realtime'
+      and schemaname = 'public'
+      and tablename = 'appointment_notifications'
+  ) then
+    alter publication supabase_realtime add table public.appointment_notifications;
+  end if;
+end $$;
+
+notify pgrst, 'reload schema';
+
+select
+  to_regclass('public.appointment_notifications') as appointment_notifications_table,
+  exists (
+    select 1
+    from pg_publication_tables
+    where pubname = 'supabase_realtime'
+      and schemaname = 'public'
+      and tablename = 'appointment_notifications'
+  ) as realtime_enabled;
