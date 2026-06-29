@@ -1737,6 +1737,9 @@ const App = {
     const isWait = type === 'entry_wait';
     const title = isWait ? 'Aguardar cliente' : 'Entrada autorizada';
     const eyebrow = isWait ? 'Atendimento em espera' : 'Atendimento liberado';
+    const detail = isWait
+      ? 'Mantenha aguardando na loja.'
+      : message.replace(clientName, '').replace(/\s+/g, ' ').trim();
     const icon = isWait ? 'fa-clock' : 'fa-door-open';
     card.className = 'entry-response-center';
     card.role = 'alertdialog';
@@ -1745,7 +1748,7 @@ const App = {
       <div class="entry-response-center-icon"><i class="fas ${icon}"></i></div>
       <span>${eyebrow}</span>
       <h3>${title}</h3>
-      <p><strong>${esc(clientName)}</strong>${message ? ` <small>${esc(message.replace(clientName, '').trim())}</small>` : ''}</p>
+      <p><strong>${esc(clientName)}</strong>${detail ? ` <small>${esc(detail)}</small>` : ''}</p>
       <button class="btn btn-primary" type="button" data-entry-response-ack>Entendido</button>
     </div>`;
 
