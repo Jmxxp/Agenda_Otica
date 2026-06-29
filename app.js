@@ -1696,11 +1696,11 @@ const App = {
       .filter(item => isEntryResponseNotification(item) && !item.read_at)
       .filter(item => !this.dismissedEntryResponseAlerts.has(String(item.id || item.local_id || item.created_at)));
 
-    const authorized = unread.find(item => getAppointmentNotificationType(item) === 'entry_authorized');
-    if (authorized) this.renderEntryAuthorizedCenter(authorized);
+    const centerNotification = unread.find(item => ['entry_authorized', 'entry_wait'].includes(getAppointmentNotificationType(item)));
+    if (centerNotification) this.renderEntryResponseCenter(centerNotification);
 
     unread
-      .filter(item => item !== authorized)
+      .filter(item => item !== centerNotification)
       .slice(0, 3)
       .forEach(item => {
       const type = getAppointmentNotificationType(item);
@@ -1729,17 +1729,22 @@ const App = {
     });
   },
 
-  renderEntryAuthorizedCenter(notification) {
+  renderEntryResponseCenter(notification) {
     const card = document.createElement('div');
     const clientName = notification.client_name || 'Cliente';
     const message = cleanAppointmentNotificationMessage(notification);
+    const type = getAppointmentNotificationType(notification);
+    const isWait = type === 'entry_wait';
+    const title = isWait ? 'Aguardar cliente' : 'Entrada autorizada';
+    const eyebrow = isWait ? 'Atendimento em espera' : 'Atendimento liberado';
+    const icon = isWait ? 'fa-clock' : 'fa-door-open';
     card.className = 'entry-response-center';
     card.role = 'alertdialog';
     card.setAttribute('aria-modal', 'false');
-    card.innerHTML = `<div class="entry-response-center-card">
-      <div class="entry-response-center-icon"><i class="fas fa-door-open"></i></div>
-      <span>Atendimento liberado</span>
-      <h3>Entrada autorizada</h3>
+    card.innerHTML = `<div class="entry-response-center-card ${type}">
+      <div class="entry-response-center-icon"><i class="fas ${icon}"></i></div>
+      <span>${eyebrow}</span>
+      <h3>${title}</h3>
       <p><strong>${esc(clientName)}</strong>${message ? ` <small>${esc(message.replace(clientName, '').trim())}</small>` : ''}</p>
       <button class="btn btn-primary" type="button" data-entry-response-ack>Entendido</button>
     </div>`;
