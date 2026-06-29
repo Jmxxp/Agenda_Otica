@@ -1599,6 +1599,7 @@ const App = {
     this.updatePrescriptionNotifications();
     this.renderPrescriptionRealtimeAlerts();
     this.renderEntryResponseAlerts();
+    this.renderOptometristEntryWaitCards();
     this.maybeShowPendingEntryRequest();
 
     if (this.activeView === 'clients') this.renderClients();
@@ -1853,6 +1854,142 @@ const App = {
     this.openEntryRequestModal(next);
   },
 
+  renderOptometristEntryWaitCards() {
+    document.querySelectorAll('.entry-wait-float-wrap').forEach(node => node.remove());
+    if (DB.profile?.role !== 'optometrist') return;
+
+    const waitingRequests = this.waitingEntryRequests();
+    if (!waitingRequests.length) return;
+
+    const wrap = document.createElement('div');
+    wrap.className = 'entry-wait-float-wrap';
+    wrap.setAttribute('aria-label', 'Clientes aguardando autorizacao de entrada');
+    wrap.innerHTML = waitingRequests.slice(0, 4).map((request, index) => {
+      const store = DB.getStore(request.store_id);
+      const appointment = request.appointment_id
+        ? DB.appointments.find(apt => apt.id === request.appointment_id)
+        : null;
+      const storeColor = (DB.getStore(appointment?.store_id) || store)?.color || '#f59e0b';
+      const time = request.appointment_time || appointment?.time;
+      const date = request.appointment_date || appointment?.date;
+      const when = [
+        time ? normalizeTime(time) : '',
+        date ? this.fmtDateDisplay(parseLocalDate(date)) : '',
+      ].filter(Boolean).join(' - ');
+      return `<button class="entry-wait-float-card" type="button" data-entry-wait-index="${index}" style="--entry-store:${esc(storeColor)}">
+        <span class="entry-wait-float-icon"><i class="fas fa-clock"></i></span>
+        <span class="entry-wait-float-copy">
+          <span class="entry-wait-float-status">Aguardando na loja</span>
+          <strong>${esc(request.client_name || 'Cliente')}</strong>
+          <small>${esc(store?.name || 'Loja')}${when ? ` - ${esc(when)}` : ''}</small>
+        </span>
+        <span class="entry-wait-float-action"><i class="fas fa-check"></i> Autorizar</span>
+      </button>`;
+    }).join('');
+
+    wrap.querySelectorAll('[data-entry-wait-index]').forEach(button => {
+      button.addEventListener('click', () => {
+        const request = waitingRequests[Number(button.dataset.entryWaitIndex)];
+        if (request) this.openEntryWaitAuthorizeModal(request);
+      });
+    });
+    document.body.appendChild(wrap);
+  },
+
+  waitingEntryRequests() {
+    if (DB.profile?.role !== 'optometrist') return [];
+
+    const timeline = DB.appointmentNotifications
+      .filter(item => item?.appointment_id && getAppointmentNotificationType(item).startsWith('entry_'))
+      .sort((a, b) => new Date(a.created_at || 0) - new Date(b.created_at || 0));
+    const byAppointment = new Map();
+
+    timeline.forEach(item => {
+      const appointmentId = String(item.appointment_id);
+      const current = byAppointment.get(appointmentId) || { request: null, wait: null, latest: null };
+      const type = getAppointmentNotificationType(item);
+
+      if (type === 'entry_requested') {
+        byAppointment.set(appointmentId, { request: item, wait: null, latest: item });
+        return;
+      }
+
+      if (type === 'entry_wait') {
+        byAppointment.set(appointmentId, {
+          request: current.request || item,
+          wait: item,
+          latest: item,
+        });
+        return;
+      }
+
+      if (type === 'entry_authorized' || type === 'entry_cancel') {
+        byAppointment.set(appointmentId, { ...current, wait: null, latest: item });
+      }
+    });
+
+    return Array.from(byAppointment.values())
+      .filter(item => item.wait && item.latest === item.wait)
+      .map(item => {
+        const appointment = DB.appointments.find(apt => apt.id === item.wait.appointment_id);
+        if (appointment?.status === 'cancelled') return null;
+        return {
+          ...item.request,
+          store_id: item.wait.store_id || item.request?.store_id,
+          appointment_id: item.wait.appointment_id || item.request?.appointment_id,
+          client_id: item.wait.client_id || item.request?.client_id || appointment?.client_id || null,
+          client_name: item.wait.client_name || item.request?.client_name || appointment?.client_name || 'Cliente',
+          appointment_date: item.wait.appointment_date || item.request?.appointment_date || appointment?.date || null,
+          appointment_time: item.wait.appointment_time || item.request?.appointment_time || appointment?.time || null,
+          waitNotification: item.wait,
+        };
+      })
+      .filter(Boolean)
+      .sort((a, b) => new Date(b.waitNotification?.created_at || 0) - new Date(a.waitNotification?.created_at || 0));
+  },
+
+  openEntryWaitAuthorizeModal(request) {
+    const requestStore = DB.getStore(request.store_id);
+    const appointment = request.appointment_id
+      ? DB.appointments.find(apt => apt.id === request.appointment_id)
+      : null;
+    const appointmentStore = DB.getStore(appointment?.store_id) || requestStore;
+    const storeColor = appointmentStore?.color || requestStore?.color || '#f59e0b';
+    const date = request.appointment_date || appointment?.date;
+    const time = request.appointment_time || appointment?.time;
+
+    this.openModal(`<div class="entry-request-shell entry-wait-authorize-shell" role="dialog" aria-modal="true" style="--entry-store:${esc(storeColor)}">
+      <button class="entry-wait-close-corner modal-close" type="button" title="Fechar">
+        <i class="fas fa-xmark"></i>
+      </button>
+      <div class="entry-request-pulse"><i class="fas fa-clock"></i></div>
+      <div class="entry-request-copy">
+        <span>Cliente aguardando</span>
+        <h3>Autorizar entrada?</h3>
+        <p>${esc(request.client_name || 'Cliente')} esta aguardando na ${esc(requestStore?.name || 'loja')}. Autorize quando puder receber.</p>
+      </div>
+      <div class="entry-request-meta">
+        <div><small>Cliente</small><strong>${esc(request.client_name || 'Cliente')}</strong></div>
+        <div class="entry-request-time-card">
+          <small>Horario</small>
+          <strong class="entry-request-time">${time ? normalizeTime(time) : '--:--'}</strong>
+          <span class="entry-request-date">${date ? this.fmtDateDisplay(parseLocalDate(date)) : ''}</span>
+        </div>
+      </div>
+      <div class="entry-request-actions is-single">
+        <button class="btn btn-entry-authorize" type="button" id="authorize-wait-entry"><i class="fas fa-check"></i> Autorizar entrada agora</button>
+      </div>
+    </div>`, {
+      overlayClass: 'entry-request-overlay',
+      boxClass: 'entry-request-modal entry-wait-authorize-modal',
+      entryAppointmentId: request.appointment_id,
+    });
+
+    document.getElementById('authorize-wait-entry')?.addEventListener('click', event => {
+      this.authorizeWaitingEntryRequest(request, event.currentTarget);
+    });
+  },
+
   pendingEntryRequests() {
     return DB.appointmentNotifications
       .filter(item => getAppointmentNotificationType(item) === 'entry_requested')
@@ -1930,6 +2067,30 @@ const App = {
       this.render();
       this.toast('Resposta enviada para a loja', 'success');
       this.maybeShowPendingEntryRequest();
+    } catch (err) {
+      button.disabled = false;
+      button.classList.remove('loading-btn');
+      this.toast(err.message, 'error');
+    }
+  },
+
+  async authorizeWaitingEntryRequest(request, button) {
+    const stillWaiting = this.waitingEntryRequests()
+      .some(item => String(item.appointment_id) === String(request.appointment_id));
+    if (!stillWaiting) {
+      this.closeModal();
+      this.render();
+      this.toast('Este cliente nao esta mais em espera', 'info');
+      return;
+    }
+
+    button.disabled = true;
+    button.classList.add('loading-btn');
+    try {
+      await DB.respondAppointmentEntry(request, 'authorize');
+      this.closeModal();
+      this.render();
+      this.toast('Entrada autorizada e loja notificada', 'success');
     } catch (err) {
       button.disabled = false;
       button.classList.remove('loading-btn');
