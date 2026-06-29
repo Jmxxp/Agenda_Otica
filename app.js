@@ -516,6 +516,7 @@ const DB = {
         if (payload.eventType === 'INSERT') {
           if (isEntryResponseNotification(notification)) {
             this.toastAppointmentEntryResponseRealtime(notification);
+            App.refreshOpenAppointmentEntryPanel?.(notification.appointment_id);
           } else if (type === 'appointment_cancelled') {
             this.toastAppointmentCancelledRealtime(notification);
           }
@@ -1045,7 +1046,7 @@ const DB = {
     const responseMap = {
       authorize: {
         prefix: ENTRY_AUTHORIZED_PREFIX,
-        message: `Encaminhe ${clientName} para atendimento agora.`,
+        message: `${clientName} deve subir para atendimento agora.`,
       },
       wait: {
         prefix: ENTRY_WAIT_PREFIX,
@@ -1688,13 +1689,20 @@ const App = {
     const wrap = document.getElementById('toasts');
     if (!wrap) return;
     wrap.querySelectorAll('.entry-response-alert').forEach(alert => alert.remove());
+    document.querySelectorAll('.entry-response-center').forEach(alert => alert.remove());
     if (DB.profile?.role !== 'store') return;
 
     const unread = DB.appointmentNotifications
       .filter(item => isEntryResponseNotification(item) && !item.read_at)
       .filter(item => !this.dismissedEntryResponseAlerts.has(String(item.id || item.local_id || item.created_at)));
 
-    unread.slice(0, 3).forEach(item => {
+    const authorized = unread.find(item => getAppointmentNotificationType(item) === 'entry_authorized');
+    if (authorized) this.renderEntryAuthorizedCenter(authorized);
+
+    unread
+      .filter(item => item !== authorized)
+      .slice(0, 3)
+      .forEach(item => {
       const type = getAppointmentNotificationType(item);
       const icon = type === 'entry_authorized' ? 'fa-door-open' : type === 'entry_wait' ? 'fa-clock' : 'fa-ban';
       const alert = document.createElement('div');
@@ -1719,6 +1727,35 @@ const App = {
       });
       wrap.prepend(alert);
     });
+  },
+
+  renderEntryAuthorizedCenter(notification) {
+    const card = document.createElement('div');
+    card.className = 'entry-response-center';
+    card.role = 'alertdialog';
+    card.setAttribute('aria-modal', 'false');
+    card.innerHTML = `<div class="entry-response-center-card">
+      <div class="entry-response-center-icon"><i class="fas fa-door-open"></i></div>
+      <span>Entrada autorizada</span>
+      <h3>Cliente deve subir</h3>
+      <p>${esc(cleanAppointmentNotificationMessage(notification))}</p>
+      <button class="btn btn-primary" type="button" data-entry-response-ack>Entendido</button>
+    </div>`;
+
+    card.querySelector('[data-entry-response-ack]').addEventListener('click', () => {
+      this.ackEntryResponse(notification);
+    });
+    document.body.appendChild(card);
+  },
+
+  async ackEntryResponse(notification) {
+    try {
+      if (notification.id && !notification.read_at) await DB.markAppointmentNotificationRead(notification.id);
+      this.dismissedEntryResponseAlerts.add(String(notification.id || notification.local_id || notification.created_at));
+      this.render();
+    } catch (err) {
+      this.toast(err.message, 'error');
+    }
   },
 
   async openAppointmentNotification(notification) {
@@ -1826,28 +1863,37 @@ const App = {
   openEntryRequestModal(request) {
     const requestKey = String(request.id || request.local_id || `${request.appointment_id}:${request.created_at}`);
     this.activeEntryRequestId = requestKey;
-    const store = DB.getStore(request.store_id);
+    const requestStore = DB.getStore(request.store_id);
     const appointment = request.appointment_id
       ? DB.appointments.find(apt => apt.id === request.appointment_id)
       : null;
+    const appointmentStore = DB.getStore(appointment?.store_id) || requestStore;
+    const storeColor = appointmentStore?.color || requestStore?.color || '#5b5ff4';
     const date = request.appointment_date || appointment?.date;
     const time = request.appointment_time || appointment?.time;
 
-    this.openModal(`<div class="entry-request-shell" role="alertdialog" aria-modal="true">
+    this.openModal(`<div class="entry-request-shell" role="alertdialog" aria-modal="true" style="--entry-store:${esc(storeColor)}">
+      <button class="entry-request-cancel-corner" type="button" data-entry-response="cancel" title="Solicitar cancelamento do agendamento">
+        <i class="fas fa-ban"></i>
+        <span>Cancelar</span>
+      </button>
       <div class="entry-request-pulse"><i class="fas fa-door-open"></i></div>
       <div class="entry-request-copy">
         <span>Solicitacao da loja</span>
         <h3>Encaminhar cliente?</h3>
-        <p>${esc(store?.name || 'Loja')} esta solicitando enviar ${esc(request.client_name || 'Cliente')} para o atendimento.</p>
+        <p>${esc(requestStore?.name || 'Loja')} esta solicitando enviar ${esc(request.client_name || 'Cliente')} para o atendimento.</p>
       </div>
       <div class="entry-request-meta">
         <div><small>Cliente</small><strong>${esc(request.client_name || 'Cliente')}</strong></div>
-        <div><small>Horario</small><strong>${date ? this.fmtDateDisplay(parseLocalDate(date)) : '--'} ${time ? normalizeTime(time) : ''}</strong></div>
+        <div class="entry-request-time-card">
+          <small>Horario</small>
+          <strong class="entry-request-time">${time ? normalizeTime(time) : '--:--'}</strong>
+          <span class="entry-request-date">${date ? this.fmtDateDisplay(parseLocalDate(date)) : ''}</span>
+        </div>
       </div>
       <div class="entry-request-actions">
         <button class="btn btn-entry-authorize" type="button" data-entry-response="authorize"><i class="fas fa-check"></i> Autorizar</button>
         <button class="btn btn-entry-wait" type="button" data-entry-response="wait"><i class="fas fa-clock"></i> Aguardar</button>
-        <button class="btn btn-entry-cancel" type="button" data-entry-response="cancel"><i class="fas fa-ban"></i> Cancelar</button>
       </div>
     </div>`, {
       locked: true,
@@ -2581,7 +2627,7 @@ const App = {
       <h3>${canEdit ? 'Editar' : 'Visualizar'} agendamento</h3>
       <button class="modal-close">&times;</button>
     </div>
-    <form class="modal-body form-stack" id="appointment-detail-form">
+    <form class="modal-body form-stack" id="appointment-detail-form" data-appointment-id="${esc(apt.id)}">
       <label>Loja
         <input type="text" id="apt-store-name" value="${esc(store?.name || 'Loja')}" disabled>
       </label>
@@ -2730,7 +2776,7 @@ const App = {
 
   renderEntryRequestPanel(appointment, status) {
     const pending = status?.type === 'entry_requested';
-    return `<section class="entry-request-card ${status ? `is-${status.tone}` : ''}">
+    return `<section class="entry-request-card ${status ? `is-${status.tone}` : ''}" data-entry-request-panel>
       <div class="entry-request-card-copy">
         <span>Entrada do cliente</span>
         <strong>${status ? esc(status.title) : 'Cliente aguardando chamada'}</strong>
@@ -2741,6 +2787,22 @@ const App = {
         ${pending ? 'Solicitado' : 'Solicitar entrada'}
       </button>
     </section>`;
+  },
+
+  refreshOpenAppointmentEntryPanel(appointmentId) {
+    const form = document.getElementById('appointment-detail-form');
+    if (!form || form.dataset.appointmentId !== appointmentId) return;
+    const panel = form.querySelector('[data-entry-request-panel]');
+    const appointment = DB.appointments.find(apt => apt.id === appointmentId);
+    if (!panel || !appointment) return;
+
+    const next = document.createElement('div');
+    next.innerHTML = this.renderEntryRequestPanel(appointment, this.getAppointmentEntryStatus(appointment));
+    const nextPanel = next.firstElementChild;
+    panel.replaceWith(nextPanel);
+    nextPanel.querySelector('#request-entry')?.addEventListener('click', () => {
+      this.openEntryRequestConfirm(appointment);
+    });
   },
 
   openEntryRequestConfirm(appointment) {
