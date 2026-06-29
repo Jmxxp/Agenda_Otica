@@ -525,8 +525,11 @@ on public.appointment_notifications
 for select
 to authenticated
 using (
-  app_private.current_profile_role() = 'store'
-  and store_id = app_private.current_profile_store_id()
+  app_private.current_profile_role() in ('admin', 'optometrist')
+  or (
+    app_private.current_profile_role() = 'store'
+    and store_id = app_private.current_profile_store_id()
+  )
 );
 
 drop policy if exists "appointment_notifications_insert_allowed" on public.appointment_notifications;

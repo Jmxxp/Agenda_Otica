@@ -167,8 +167,11 @@ begin
       for select
       to authenticated
       using (
-        (select app_private.current_profile_role()) = 'store'
-        and store_id = (select app_private.current_profile_store_id())
+        (select app_private.current_profile_role()) in ('admin', 'optometrist')
+        or (
+          (select app_private.current_profile_role()) = 'store'
+          and store_id = (select app_private.current_profile_store_id())
+        )
       )
     $policy$;
 

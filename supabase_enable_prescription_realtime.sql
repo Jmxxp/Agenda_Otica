@@ -130,7 +130,64 @@ begin
   end if;
 
   if to_regclass('public.appointment_notifications') is not null then
+    execute 'alter table public.appointment_notifications enable row level security';
+    execute 'grant select, insert, update, delete on table public.appointment_notifications to authenticated';
     execute 'alter table public.appointment_notifications replica identity full';
+
+    execute 'drop policy if exists "appointment_notifications_store_select_own" on public.appointment_notifications';
+    execute $policy$
+      create policy "appointment_notifications_store_select_own"
+      on public.appointment_notifications
+      for select
+      to authenticated
+      using (
+        (select app_private.current_profile_role()) in ('admin', 'optometrist')
+        or (
+          (select app_private.current_profile_role()) = 'store'
+          and store_id = (select app_private.current_profile_store_id())
+        )
+      )
+    $policy$;
+
+    execute 'drop policy if exists "appointment_notifications_insert_allowed" on public.appointment_notifications';
+    execute $policy$
+      create policy "appointment_notifications_insert_allowed"
+      on public.appointment_notifications
+      for insert
+      to authenticated
+      with check (
+        (select app_private.current_profile_role()) in ('admin', 'optometrist')
+        or store_id = (select app_private.current_profile_store_id())
+      )
+    $policy$;
+
+    execute 'drop policy if exists "appointment_notifications_store_update_own" on public.appointment_notifications';
+    execute $policy$
+      create policy "appointment_notifications_store_update_own"
+      on public.appointment_notifications
+      for update
+      to authenticated
+      using (
+        (select app_private.current_profile_role()) = 'store'
+        and store_id = (select app_private.current_profile_store_id())
+      )
+      with check (
+        (select app_private.current_profile_role()) = 'store'
+        and store_id = (select app_private.current_profile_store_id())
+      )
+    $policy$;
+
+    execute 'drop policy if exists "appointment_notifications_store_delete_own" on public.appointment_notifications';
+    execute $policy$
+      create policy "appointment_notifications_store_delete_own"
+      on public.appointment_notifications
+      for delete
+      to authenticated
+      using (
+        (select app_private.current_profile_role()) = 'store'
+        and store_id = (select app_private.current_profile_store_id())
+      )
+    $policy$;
 
     if not exists (
       select 1

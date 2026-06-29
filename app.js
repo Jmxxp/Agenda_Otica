@@ -13,6 +13,11 @@ const SOUND_PREF_KEY = 'otica_prescription_sound';
 const SOUND_MUTED_KEY = 'otica_prescription_sound_muted';
 const LOCAL_APPOINTMENT_NOTIFICATIONS_KEY = 'otica_appointment_notifications';
 const APPOINTMENT_NOTIFICATIONS_DISABLED_KEY = 'otica_appointment_notifications_disabled';
+const ENTRY_REQUEST_PREFIX = 'Solicitacao de entrada:';
+const ENTRY_AUTHORIZED_PREFIX = 'Entrada autorizada:';
+const ENTRY_WAIT_PREFIX = 'Aguardar entrada:';
+const ENTRY_CANCEL_PREFIX = 'Cancelar agendamento:';
+const ENTRY_RESPONSE_TYPES = ['entry_authorized', 'entry_wait', 'entry_cancel'];
 const REALTIME_FALLBACK_REFRESH_MS = 30000;
 const REALTIME_RECONNECT_MS = 2500;
 const NOTIFICATION_SOUNDS = [
@@ -43,6 +48,7 @@ const DB = {
   appointmentNotificationsAvailable: localStorage.getItem(APPOINTMENT_NOTIFICATIONS_DISABLED_KEY) !== '1',
   lastPrescriptionRealtimeToast: null,
   lastAppointmentCancelToast: null,
+  lastAppointmentEntryToast: null,
   lastSync: null,
   timer: null,
   realtimeChannel: null,
@@ -218,22 +224,31 @@ const DB = {
   },
 
   async loadAppointmentNotifications() {
-    if (this.profile?.role !== 'store' || !this.profile.store_id) return [];
-    if (!this.appointmentNotificationsAvailable) return this.loadLocalAppointmentNotifications();
-    const { data, error } = await this.client
+    if (!['store', 'optometrist'].includes(this.profile?.role)) return [];
+    if (this.profile?.role === 'store' && !this.profile.store_id) return [];
+    if (!this.appointmentNotificationsAvailable && this.profile?.role === 'store') return this.loadLocalAppointmentNotifications();
+
+    let query = this.client
       .from('appointment_notifications')
       .select('*')
-      .eq('store_id', this.profile.store_id)
       .order('created_at', { ascending: false })
-      .limit(30);
+      .limit(this.profile?.role === 'optometrist' ? 80 : 30);
+
+    if (this.profile?.role === 'store') {
+      query = query.eq('store_id', this.profile.store_id);
+    }
+
+    const { data, error } = await query;
 
     if (isMissingTableError(error)) {
       this.appointmentNotificationsAvailable = false;
       localStorage.setItem(APPOINTMENT_NOTIFICATIONS_DISABLED_KEY, '1');
-      return this.loadLocalAppointmentNotifications();
+      return this.profile?.role === 'store' ? this.loadLocalAppointmentNotifications() : [];
     }
     if (error) throw error;
     this.appointmentNotificationsAvailable = true;
+    localStorage.removeItem(APPOINTMENT_NOTIFICATIONS_DISABLED_KEY);
+    if (this.profile?.role === 'optometrist') return data || [];
     return this.mergeAppointmentNotifications(data || [], this.loadLocalAppointmentNotifications());
   },
 
@@ -268,17 +283,21 @@ const DB = {
       .slice(0, 30);
   },
 
-  mergeAppointmentNotifications(primary, fallback) {
+  mergeAppointmentNotifications(primary, fallback, limit = 30) {
     const seen = new Set();
     return [...primary, ...fallback].filter(item => {
       const key = this.appointmentNotificationKey(item);
       if (seen.has(key)) return false;
       seen.add(key);
       return true;
-    }).sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0)).slice(0, 30);
+    }).sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0)).slice(0, limit);
   },
 
   appointmentNotificationKey(item) {
+    const type = getAppointmentNotificationType(item);
+    if (type !== 'appointment_cancelled') {
+      return `${type}:${item.id || item.local_id || item.created_at || ''}:${item.appointment_id || ''}`;
+    }
     return `${item.appointment_id || item.local_id || ''}:${item.client_name || ''}:${item.appointment_date || ''}:${item.appointment_time || ''}`;
   },
 
@@ -421,9 +440,88 @@ const DB = {
     return true;
   },
 
+  applyAppointmentNotificationRealtime(payload) {
+    if (!['store', 'optometrist'].includes(this.profile?.role)) return false;
+
+    if (payload.eventType === 'DELETE') {
+      const removedId = payload.old?.id;
+      if (!removedId) return false;
+      const before = this.appointmentNotifications.length;
+      this.appointmentNotifications = this.appointmentNotifications
+        .filter(item => String(item.id) !== String(removedId));
+      return before !== this.appointmentNotifications.length;
+    }
+
+    const notification = payload.new;
+    if (!notification?.id) return false;
+    if (this.profile?.role === 'store' && notification.store_id !== this.profile.store_id) return false;
+
+    const existingIndex = this.appointmentNotifications
+      .findIndex(item => String(item.id) === String(notification.id));
+    if (existingIndex >= 0) {
+      this.appointmentNotifications[existingIndex] = {
+        ...this.appointmentNotifications[existingIndex],
+        ...notification,
+      };
+    } else {
+      this.appointmentNotifications.unshift(notification);
+    }
+
+    this.appointmentNotifications = this.mergeAppointmentNotifications(
+      this.appointmentNotifications,
+      [],
+      this.profile?.role === 'optometrist' ? 80 : 30
+    );
+    return true;
+  },
+
   handleRealtimePayload(table, payload) {
     if (table === 'appointments') {
       this.handleAppointmentRealtime(payload);
+    }
+
+    if (table === 'appointment_notifications') {
+      const notification = payload.new || payload.old || {};
+      const type = getAppointmentNotificationType(notification);
+
+      if (
+        this.profile?.role === 'optometrist'
+        && payload.eventType === 'INSERT'
+        && type === 'entry_requested'
+        && notification.created_by !== this.user?.id
+      ) {
+        this.applyAppointmentNotificationRealtime(payload);
+        App.notifyIncomingEntryRequest?.(notification);
+        return;
+      }
+
+      if (
+        this.profile?.role === 'optometrist'
+        && payload.eventType === 'INSERT'
+        && isEntryResponseNotification(notification)
+      ) {
+        this.applyAppointmentNotificationRealtime(payload);
+        if (notification.created_by !== this.user?.id) App.resolveActiveEntryRequest?.(notification);
+        return;
+      }
+
+      if (
+        this.profile?.role === 'store'
+        && notification.store_id === this.profile.store_id
+      ) {
+        this.applyAppointmentNotificationRealtime(payload);
+        App.updatePrescriptionNotifications?.();
+        App.renderEntryResponseAlerts?.();
+
+        if (payload.eventType === 'INSERT') {
+          if (isEntryResponseNotification(notification)) {
+            this.toastAppointmentEntryResponseRealtime(notification);
+          } else if (type === 'appointment_cancelled') {
+            this.toastAppointmentCancelledRealtime(notification);
+          }
+        }
+        return;
+      }
     }
 
     if (this.profile?.role !== 'store') return;
@@ -439,15 +537,6 @@ const DB = {
       if (payload.eventType === 'INSERT' && !payload.new?.read_at) {
         this.toastPrescriptionRealtime(payload.new.client_id || payload.new.id);
       }
-      return;
-    }
-
-    if (
-      table === 'appointment_notifications'
-      && payload.eventType === 'INSERT'
-      && payload.new?.store_id === this.profile.store_id
-    ) {
-      this.toastAppointmentCancelledRealtime(payload.new);
       return;
     }
 
@@ -496,6 +585,14 @@ const DB = {
     if (this.lastAppointmentCancelToast === toastKey) return;
     this.lastAppointmentCancelToast = toastKey;
     App.toastAppointmentCancelled(appointment);
+  },
+
+  toastAppointmentEntryResponseRealtime(notification) {
+    const toastKey = `entry-response:${notification.id || notification.appointment_id || notification.client_name}:${notification.created_at || ''}`;
+    if (this.lastAppointmentEntryToast === toastKey) return;
+    this.lastAppointmentEntryToast = toastKey;
+    App.playAttentionSound();
+    App.renderEntryResponseAlerts();
   },
 
   canSeeStoreRealtime(storeId) {
@@ -902,6 +999,90 @@ const DB = {
     if (error) throw error;
   },
 
+  async requestAppointmentEntry(appointment) {
+    if (this.profile?.role !== 'store' || !this.profile.store_id) {
+      throw new Error('Apenas a loja pode solicitar entrada do cliente');
+    }
+    if (!appointment?.id) {
+      throw new Error('Agendamento indisponivel para esta loja');
+    }
+
+    const requestStoreId = this.profile.store_id;
+    const store = this.getStore(requestStoreId) || this.profile.stores;
+    const { error } = await this.client
+      .from('appointment_notifications')
+      .insert({
+        store_id: requestStoreId,
+        appointment_id: appointment.id,
+        client_id: appointment.client_id || null,
+        client_name: appointment.client_name || 'Cliente',
+        appointment_date: appointment.date || null,
+        appointment_time: appointment.time ? normalizeTime(appointment.time) : null,
+        message: `${ENTRY_REQUEST_PREFIX} ${store?.name || 'Loja'} solicita encaminhar ${appointment.client_name || 'Cliente'} para atendimento.`,
+        created_by: this.user?.id || null,
+      });
+
+    if (isMissingTableError(error)) {
+      this.appointmentNotificationsAvailable = false;
+      localStorage.setItem(APPOINTMENT_NOTIFICATIONS_DISABLED_KEY, '1');
+      throw new Error('A tabela appointment_notifications precisa estar ativa no Supabase para solicitar entrada.');
+    }
+    if (error) throw error;
+    this.appointmentNotificationsAvailable = true;
+    localStorage.removeItem(APPOINTMENT_NOTIFICATIONS_DISABLED_KEY);
+    await this.refresh();
+  },
+
+  async respondAppointmentEntry(request, action) {
+    if (!['admin', 'optometrist'].includes(this.profile?.role)) {
+      throw new Error('Apenas o optometrista pode responder a solicitacao');
+    }
+    if (!request?.appointment_id || !request.store_id) {
+      throw new Error('Solicitacao invalida');
+    }
+
+    const clientName = request.client_name || 'Cliente';
+    const responseMap = {
+      authorize: {
+        prefix: ENTRY_AUTHORIZED_PREFIX,
+        message: `Encaminhe ${clientName} para atendimento agora.`,
+      },
+      wait: {
+        prefix: ENTRY_WAIT_PREFIX,
+        message: `Mantenha ${clientName} aguardando na loja.`,
+      },
+      cancel: {
+        prefix: ENTRY_CANCEL_PREFIX,
+        message: `Cancele o agendamento de ${clientName}.`,
+      },
+    };
+    const response = responseMap[action];
+    if (!response) throw new Error('Resposta invalida');
+
+    const { error } = await this.client
+      .from('appointment_notifications')
+      .insert({
+        store_id: request.store_id,
+        appointment_id: request.appointment_id,
+        client_id: request.client_id || null,
+        client_name: clientName,
+        appointment_date: request.appointment_date || null,
+        appointment_time: request.appointment_time ? normalizeTime(request.appointment_time) : null,
+        message: `${response.prefix} ${response.message}`,
+        created_by: this.user?.id || null,
+      });
+
+    if (isMissingTableError(error)) {
+      this.appointmentNotificationsAvailable = false;
+      localStorage.setItem(APPOINTMENT_NOTIFICATIONS_DISABLED_KEY, '1');
+      throw new Error('A tabela appointment_notifications precisa estar ativa no Supabase para responder.');
+    }
+    if (error) throw error;
+    this.appointmentNotificationsAvailable = true;
+    localStorage.removeItem(APPOINTMENT_NOTIFICATIONS_DISABLED_KEY);
+    await this.refresh();
+  },
+
   async markPrescriptionNotificationsRead() {
     if (this.profile?.role !== 'store' || !this.profile.store_id) return;
 
@@ -1150,6 +1331,9 @@ const App = {
   notificationSoundId: localStorage.getItem(SOUND_PREF_KEY) || 'bell',
   notificationSoundMuted: localStorage.getItem(SOUND_MUTED_KEY) === '1',
   dismissedPrescriptionAlerts: new Set(),
+  dismissedEntryResponseAlerts: new Set(),
+  handledEntryRequestIds: new Set(),
+  activeEntryRequestId: null,
 
   async boot() {
     this.bindAuth();
@@ -1292,7 +1476,7 @@ const App = {
 
   bindGlobal() {
     document.addEventListener('keydown', event => {
-      if (event.key === 'Escape') this.closeModal();
+      if (event.key === 'Escape' && !document.getElementById('modal')?.dataset.locked) this.closeModal();
       if (!this.audioUnlocked) this.unlockNotificationAudio();
     });
     document.addEventListener('pointerdown', () => this.unlockNotificationAudio(), { once: true });
@@ -1413,6 +1597,8 @@ const App = {
     this.updateConnStatus();
     this.updatePrescriptionNotifications();
     this.renderPrescriptionRealtimeAlerts();
+    this.renderEntryResponseAlerts();
+    this.maybeShowPendingEntryRequest();
 
     if (this.activeView === 'clients') this.renderClients();
     else if (this.activeView === 'admin') this.renderAdmin();
@@ -1443,7 +1629,7 @@ const App = {
 
     const show = DB.profile?.role === 'store';
     const unread = DB.prescriptionNotifications.filter(item => !item.read_at).length
-      + DB.appointmentNotifications.filter(item => !item.read_at).length;
+      + DB.appointmentNotifications.filter(item => !item.read_at && isStoreVisibleAppointmentNotification(item)).length;
     button.classList.toggle('hidden', !show);
     button.classList.toggle('has-unread', show && Boolean(unread));
     count.textContent = String(unread);
@@ -1498,6 +1684,58 @@ const App = {
     });
   },
 
+  renderEntryResponseAlerts() {
+    const wrap = document.getElementById('toasts');
+    if (!wrap) return;
+    wrap.querySelectorAll('.entry-response-alert').forEach(alert => alert.remove());
+    if (DB.profile?.role !== 'store') return;
+
+    const unread = DB.appointmentNotifications
+      .filter(item => isEntryResponseNotification(item) && !item.read_at)
+      .filter(item => !this.dismissedEntryResponseAlerts.has(String(item.id || item.local_id || item.created_at)));
+
+    unread.slice(0, 3).forEach(item => {
+      const type = getAppointmentNotificationType(item);
+      const icon = type === 'entry_authorized' ? 'fa-door-open' : type === 'entry_wait' ? 'fa-clock' : 'fa-ban';
+      const alert = document.createElement('div');
+      alert.className = `toast entry-response-alert ${type}`;
+      alert.tabIndex = 0;
+      alert.role = 'button';
+      alert.dataset.notificationId = item.id || item.local_id || '';
+      alert.innerHTML = `<i class="fas ${icon}"></i><span><strong>${esc(getAppointmentNotificationTitle(item))}</strong><small>${esc(cleanAppointmentNotificationMessage(item))}</small></span><button class="toast-close" type="button" title="Fechar"><i class="fas fa-xmark"></i></button>`;
+      alert.addEventListener('click', event => {
+        if (event.target.closest('.toast-close')) return;
+        this.openAppointmentNotification(item);
+      });
+      alert.addEventListener('keydown', event => {
+        if (event.key !== 'Enter' && event.key !== ' ') return;
+        event.preventDefault();
+        this.openAppointmentNotification(item);
+      });
+      alert.querySelector('.toast-close').addEventListener('click', event => {
+        event.stopPropagation();
+        this.dismissedEntryResponseAlerts.add(String(item.id || item.local_id || item.created_at));
+        alert.remove();
+      });
+      wrap.prepend(alert);
+    });
+  },
+
+  async openAppointmentNotification(notification) {
+    try {
+      if (notification.id && !notification.read_at) await DB.markAppointmentNotificationRead(notification.id);
+      this.dismissedEntryResponseAlerts.add(String(notification.id || notification.local_id || notification.created_at));
+      this.render();
+      const appointment = notification.appointment_id
+        ? DB.appointments.find(apt => apt.id === notification.appointment_id)
+        : null;
+      if (appointment && appointment.status !== 'cancelled') this.openAppointmentDetail(appointment.id);
+      else this.openPrescriptionNotifications();
+    } catch (err) {
+      this.toast(err.message, 'error');
+    }
+  },
+
   unlockNotificationAudio() {
     if (this.audioUnlocked) return;
     const AudioCtx = window.AudioContext || window.webkitAudioContext;
@@ -1525,9 +1763,122 @@ const App = {
     }
   },
 
+  playAttentionSound() {
+    this.unlockNotificationAudio();
+    this.playPrescriptionNotificationSound();
+  },
+
   getSelectedNotificationSound() {
     return NOTIFICATION_SOUNDS.find(sound => sound.id === this.notificationSoundId)
       || NOTIFICATION_SOUNDS[0];
+  },
+
+  notifyIncomingEntryRequest(notification) {
+    if (DB.profile?.role !== 'optometrist') return;
+    if (!this.isEntryRequestPending(notification)) return;
+    this.playAttentionSound();
+    this.maybeShowPendingEntryRequest(notification);
+  },
+
+  resolveActiveEntryRequest(notification) {
+    const modal = document.getElementById('modal');
+    if (!modal?.dataset.entryAppointmentId) return;
+    if (modal.dataset.entryAppointmentId !== notification.appointment_id) return;
+    if (modal.dataset.entryRequestId) this.handledEntryRequestIds.add(modal.dataset.entryRequestId);
+    this.activeEntryRequestId = null;
+    this.closeModal();
+    this.render();
+    this.toast('Solicitacao ja respondida por outro optometrista', 'info');
+  },
+
+  maybeShowPendingEntryRequest(priorityRequest = null) {
+    if (DB.profile?.role !== 'optometrist') return;
+    const currentModal = document.getElementById('modal');
+    if (this.activeEntryRequestId && currentModal?.dataset.entryRequestId === this.activeEntryRequestId) return;
+    if (!currentModal) this.activeEntryRequestId = null;
+
+    const requests = priorityRequest ? [priorityRequest] : this.pendingEntryRequests();
+    const next = requests.find(request => {
+      const key = String(request.id || request.local_id || `${request.appointment_id}:${request.created_at}`);
+      return this.isEntryRequestPending(request) && !this.handledEntryRequestIds.has(key);
+    });
+    if (!next) return;
+    this.openEntryRequestModal(next);
+  },
+
+  pendingEntryRequests() {
+    return DB.appointmentNotifications
+      .filter(item => getAppointmentNotificationType(item) === 'entry_requested')
+      .filter(item => this.isEntryRequestPending(item))
+      .sort((a, b) => new Date(a.created_at || 0) - new Date(b.created_at || 0));
+  },
+
+  isEntryRequestPending(request) {
+    if (!request?.appointment_id || getAppointmentNotificationType(request) !== 'entry_requested') return false;
+    const requestedAt = new Date(request.created_at || 0).getTime();
+    return !DB.appointmentNotifications.some(item => {
+      if (item.appointment_id !== request.appointment_id) return false;
+      if (!isEntryResponseNotification(item)) return false;
+      return new Date(item.created_at || 0).getTime() >= requestedAt;
+    });
+  },
+
+  openEntryRequestModal(request) {
+    const requestKey = String(request.id || request.local_id || `${request.appointment_id}:${request.created_at}`);
+    this.activeEntryRequestId = requestKey;
+    const store = DB.getStore(request.store_id);
+    const appointment = request.appointment_id
+      ? DB.appointments.find(apt => apt.id === request.appointment_id)
+      : null;
+    const date = request.appointment_date || appointment?.date;
+    const time = request.appointment_time || appointment?.time;
+
+    this.openModal(`<div class="entry-request-shell" role="alertdialog" aria-modal="true">
+      <div class="entry-request-pulse"><i class="fas fa-door-open"></i></div>
+      <div class="entry-request-copy">
+        <span>Solicitacao da loja</span>
+        <h3>Encaminhar cliente?</h3>
+        <p>${esc(store?.name || 'Loja')} esta solicitando enviar ${esc(request.client_name || 'Cliente')} para o atendimento.</p>
+      </div>
+      <div class="entry-request-meta">
+        <div><small>Cliente</small><strong>${esc(request.client_name || 'Cliente')}</strong></div>
+        <div><small>Horario</small><strong>${date ? this.fmtDateDisplay(parseLocalDate(date)) : '--'} ${time ? normalizeTime(time) : ''}</strong></div>
+      </div>
+      <div class="entry-request-actions">
+        <button class="btn btn-entry-authorize" type="button" data-entry-response="authorize"><i class="fas fa-check"></i> Autorizar</button>
+        <button class="btn btn-entry-wait" type="button" data-entry-response="wait"><i class="fas fa-clock"></i> Aguardar</button>
+        <button class="btn btn-entry-cancel" type="button" data-entry-response="cancel"><i class="fas fa-ban"></i> Cancelar</button>
+      </div>
+    </div>`, {
+      locked: true,
+      overlayClass: 'entry-request-overlay',
+      boxClass: 'entry-request-modal',
+      entryRequestId: requestKey,
+      entryAppointmentId: request.appointment_id,
+    });
+
+    document.querySelectorAll('[data-entry-response]').forEach(button => {
+      button.addEventListener('click', () => this.answerEntryRequest(request, button.dataset.entryResponse, button));
+    });
+  },
+
+  async answerEntryRequest(request, action, button) {
+    button.disabled = true;
+    button.classList.add('loading-btn');
+    const requestKey = String(request.id || request.local_id || `${request.appointment_id}:${request.created_at}`);
+    try {
+      await DB.respondAppointmentEntry(request, action);
+      this.handledEntryRequestIds.add(requestKey);
+      this.activeEntryRequestId = null;
+      this.closeModal();
+      this.render();
+      this.toast('Resposta enviada para a loja', 'success');
+      this.maybeShowPendingEntryRequest();
+    } catch (err) {
+      button.disabled = false;
+      button.classList.remove('loading-btn');
+      this.toast(err.message, 'error');
+    }
   },
 
   async openPrescriptionNotification(notificationId) {
@@ -2211,6 +2562,11 @@ const App = {
     const canEditCurrentPrescription = canViewPrescription && canEdit && ['admin', 'store'].includes(DB.profile.role);
     const canEditNewPrescription = canViewPrescription && canEdit && ['admin', 'optometrist'].includes(DB.profile.role);
     const canDeleteNewPrescription = Boolean(canViewPrescription && client?.id && client?.new_prescription && DB.profile.role === 'admin');
+    const canRequestEntry = DB.profile.role === 'store'
+      && apt.status !== 'cancelled'
+      && Boolean(DB.profile.store_id);
+    const entryStatus = canRequestEntry ? this.getAppointmentEntryStatus(apt) : null;
+    const entryRequestPanel = canRequestEntry ? this.renderEntryRequestPanel(apt, entryStatus) : '';
     const prescriptionSection = canViewPrescription
       ? this.renderPrescriptionSection(currentPrescription, newPrescription, {
         currentEditable: canEditCurrentPrescription,
@@ -2246,6 +2602,7 @@ const App = {
       <label>Observacoes
         <textarea id="apt-notes" ${canEdit ? '' : 'disabled'}>${esc(apt.notes || '')}</textarea>
       </label>
+      ${entryRequestPanel}
       ${prescriptionSection}
       <div class="modal-foot appointment-actions">
         <button class="btn btn-whatsapp" type="button" id="whatsapp"><i class="fab fa-whatsapp"></i> WhatsApp</button>
@@ -2275,6 +2632,10 @@ const App = {
         window.open(`https://wa.me/55${phone}?text=${msg}`, '_blank');
       }
     };
+
+    document.getElementById('request-entry')?.addEventListener('click', () => {
+      this.openEntryRequestConfirm(apt);
+    });
 
     document.getElementById('delete-apt')?.addEventListener('click', async () => {
       if (!confirm('Excluir este agendamento?')) return;
@@ -2323,6 +2684,110 @@ const App = {
         this.toast(err.message, 'error');
       }
     };
+  },
+
+  getAppointmentEntryStatus(appointment) {
+    const items = DB.appointmentNotifications
+      .filter(item => item.appointment_id === appointment.id)
+      .filter(item => getAppointmentNotificationType(item).startsWith('entry_'))
+      .sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
+    const latest = items[0];
+    if (!latest) return null;
+
+    const type = getAppointmentNotificationType(latest);
+    const statusMap = {
+      entry_requested: {
+        type,
+        tone: 'pending',
+        icon: 'fa-paper-plane',
+        title: 'Solicitacao enviada',
+        text: 'Aguardando resposta do optometrista.',
+      },
+      entry_authorized: {
+        type,
+        tone: 'authorized',
+        icon: 'fa-door-open',
+        title: 'Entrada autorizada',
+        text: cleanAppointmentNotificationMessage(latest),
+      },
+      entry_wait: {
+        type,
+        tone: 'wait',
+        icon: 'fa-clock',
+        title: 'Optometrista pediu aguardar',
+        text: cleanAppointmentNotificationMessage(latest),
+      },
+      entry_cancel: {
+        type,
+        tone: 'cancel',
+        icon: 'fa-ban',
+        title: 'Solicitado cancelar',
+        text: cleanAppointmentNotificationMessage(latest),
+      },
+    };
+    return statusMap[type] || null;
+  },
+
+  renderEntryRequestPanel(appointment, status) {
+    const pending = status?.type === 'entry_requested';
+    return `<section class="entry-request-card ${status ? `is-${status.tone}` : ''}">
+      <div class="entry-request-card-copy">
+        <span>Entrada do cliente</span>
+        <strong>${status ? esc(status.title) : 'Cliente aguardando chamada'}</strong>
+        <small>${status ? esc(status.text) : 'Solicite ao optometrista a autorizacao para encaminhar.'}</small>
+      </div>
+      <button class="btn btn-entry-request" type="button" id="request-entry" ${pending ? 'disabled' : ''}>
+        <i class="fas ${pending ? 'fa-hourglass-half' : 'fa-door-open'}"></i>
+        ${pending ? 'Solicitado' : 'Solicitar entrada'}
+      </button>
+    </section>`;
+  },
+
+  openEntryRequestConfirm(appointment) {
+    if (this.getAppointmentEntryStatus(appointment)?.type === 'entry_requested') {
+      this.toast('Ja existe uma solicitacao aguardando resposta', 'info');
+      return;
+    }
+
+    const requestStore = DB.getStore(DB.profile.store_id) || DB.profile.stores;
+    const appointmentStore = DB.getStore(appointment.store_id);
+    const storeContext = appointmentStore?.id && appointmentStore.id !== requestStore?.id
+      ? `Solicitando como ${requestStore?.name || 'sua loja'} - agendamento de ${appointmentStore.name}`
+      : requestStore?.name || appointmentStore?.name || 'Loja';
+    this.openModal(`<div class="modal-head">
+      <h3>Solicitar entrada</h3>
+      <button class="modal-close">&times;</button>
+    </div>
+    <div class="modal-body form-stack">
+      <div class="entry-confirm-card">
+        <i class="fas fa-door-open"></i>
+        <div>
+          <strong>${esc(appointment.client_name || 'Cliente')}</strong>
+          <span>${esc(storeContext)} - ${this.fmtDateDisplay(parseLocalDate(appointment.date))} as ${normalizeTime(appointment.time)}</span>
+        </div>
+      </div>
+      <p class="entry-confirm-text">Confirmar envio da solicitacao para o optometrista autorizar a entrada deste cliente?</p>
+      <div class="modal-foot">
+        <button class="btn btn-secondary modal-close" type="button">Voltar</button>
+        <button class="btn btn-primary" type="button" id="confirm-entry-request"><i class="fas fa-paper-plane"></i> Confirmar</button>
+      </div>
+    </div>`);
+
+    document.getElementById('confirm-entry-request').addEventListener('click', async event => {
+      const button = event.currentTarget;
+      button.disabled = true;
+      button.classList.add('loading-btn');
+      try {
+        await DB.requestAppointmentEntry(appointment);
+        this.closeModal();
+        this.render();
+        this.toast('Solicitacao enviada ao optometrista', 'success');
+      } catch (err) {
+        button.disabled = false;
+        button.classList.remove('loading-btn');
+        this.toast(err.message, 'error');
+      }
+    });
   },
 
   openClientModal(client = null, options = {}) {
@@ -2548,7 +3013,9 @@ const App = {
 
     const notifications = [
       ...DB.prescriptionNotifications.map(item => ({ ...item, kind: 'prescription' })),
-      ...DB.appointmentNotifications.map(item => ({ ...item, kind: 'appointment' })),
+      ...DB.appointmentNotifications
+        .filter(item => isStoreVisibleAppointmentNotification(item))
+        .map(item => ({ ...item, kind: 'appointment' })),
     ].sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
     this.openModal(`<div class="modal-head">
       <h3>Notificacoes</h3>
@@ -2556,12 +3023,15 @@ const App = {
     </div>
     <div class="modal-body form-stack">
       ${notifications.length ? `<div class="notification-list">
-        ${notifications.map(item => `<button class="notification-item ${item.read_at ? '' : 'unread'} ${item.kind === 'appointment' ? 'cancelled' : ''}" type="button" data-kind="${item.kind}" data-notification-id="${item.id || item.local_id || ''}" data-client-id="${item.client_id || ''}">
-          <strong>${item.kind === 'appointment' ? 'Agendamento cancelado' : esc(item.client_name || 'Cliente')}</strong>
-          <span>${esc(item.message || 'Receita recebida')}</span>
+        ${notifications.map(item => {
+          const appointmentType = item.kind === 'appointment' ? getAppointmentNotificationType(item) : '';
+          return `<button class="notification-item ${item.read_at ? '' : 'unread'} ${item.kind === 'appointment' ? `appointment-event ${appointmentType}` : ''}" type="button" data-kind="${item.kind}" data-notification-id="${item.id || item.local_id || ''}" data-client-id="${item.client_id || ''}">
+          <strong>${item.kind === 'appointment' ? esc(getAppointmentNotificationTitle(item)) : esc(item.client_name || 'Cliente')}</strong>
+          <span>${esc(item.kind === 'appointment' ? cleanAppointmentNotificationMessage(item) : item.message || 'Receita recebida')}</span>
           <small>${this.fmtDateTime(item.created_at)}</small>
-        </button>`).join('')}
-      </div>` : this.emptyState('fa-bell', 'Nenhuma notificacao', 'Receitas prontas e cancelamentos aparecem aqui.')}
+        </button>`;
+        }).join('')}
+      </div>` : this.emptyState('fa-bell', 'Nenhuma notificacao', 'Receitas, respostas e cancelamentos aparecem aqui.')}
       <div class="modal-foot">
         <button class="btn btn-secondary modal-close" type="button">Fechar</button>
         ${notifications.some(item => !item.read_at) ? '<button class="btn btn-primary" type="button" id="mark-notifications-read">Marcar como lidas</button>' : ''}
@@ -2572,9 +3042,8 @@ const App = {
     document.querySelectorAll('.notification-item[data-client-id]').forEach(button => {
       button.addEventListener('click', async () => {
         if (button.dataset.kind === 'appointment') {
-          await DB.markAppointmentNotificationRead(button.dataset.notificationId);
-          this.closeModal();
-          this.render();
+          const notification = DB.appointmentNotifications.find(item => String(item.id || item.local_id) === String(button.dataset.notificationId));
+          if (notification) await this.openAppointmentNotification(notification);
           return;
         }
         const notificationId = button.dataset.notificationId;
@@ -2719,12 +3188,16 @@ const App = {
     return this.isAppointmentSlotTaken(payload.date, payload.time, ignoreId);
   },
 
-  openModal(html) {
+  openModal(html, options = {}) {
     this.closeModal();
     const overlay = document.createElement('div');
     overlay.className = 'modal-overlay';
     overlay.id = 'modal';
-    overlay.innerHTML = `<div class="modal-box">${html}</div>`;
+    if (options.overlayClass) overlay.classList.add(options.overlayClass);
+    if (options.locked) overlay.dataset.locked = '1';
+    if (options.entryRequestId) overlay.dataset.entryRequestId = options.entryRequestId;
+    if (options.entryAppointmentId) overlay.dataset.entryAppointmentId = options.entryAppointmentId;
+    overlay.innerHTML = `<div class="modal-box ${options.boxClass || ''}">${html}</div>`;
     if (overlay.querySelector('.rx-prescription')) {
       overlay.querySelector('.modal-box').classList.add('prescription-modal');
     }
@@ -2733,7 +3206,7 @@ const App = {
     }
     document.body.appendChild(overlay);
     overlay.addEventListener('click', event => {
-      if (event.target === overlay) this.closeModal();
+      if (event.target === overlay && !overlay.dataset.locked) this.closeModal();
     });
     overlay.querySelectorAll('.modal-close').forEach(btn => btn.addEventListener('click', () => this.closeModal()));
     this.bindPasswordToggles(overlay);
@@ -3087,7 +3560,9 @@ const App = {
   },
 
   closeModal() {
-    document.getElementById('modal')?.remove();
+    const modal = document.getElementById('modal');
+    if (modal?.classList.contains('entry-request-overlay')) this.activeEntryRequestId = null;
+    modal?.remove();
   },
 
   toggleTheme() {
@@ -3347,6 +3822,58 @@ function isMissingTableError(error) {
     || message.includes('Could not find the table')
     || message.includes('relation "public.prescription_notifications" does not exist')
     || message.includes('relation "public.appointment_notifications" does not exist');
+}
+
+function normalizeNotificationText(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+}
+
+function getAppointmentNotificationType(item) {
+  const explicitType = String(item?.type || '');
+  if (['appointment_cancelled', 'entry_requested', ...ENTRY_RESPONSE_TYPES].includes(explicitType)) {
+    return explicitType;
+  }
+
+  const message = normalizeNotificationText(item?.message);
+  if (message.startsWith(normalizeNotificationText(ENTRY_REQUEST_PREFIX))) return 'entry_requested';
+  if (message.startsWith(normalizeNotificationText(ENTRY_AUTHORIZED_PREFIX))) return 'entry_authorized';
+  if (message.startsWith(normalizeNotificationText(ENTRY_WAIT_PREFIX))) return 'entry_wait';
+  if (message.startsWith(normalizeNotificationText(ENTRY_CANCEL_PREFIX))) return 'entry_cancel';
+  return 'appointment_cancelled';
+}
+
+function cleanAppointmentNotificationMessage(item) {
+  const message = String(item?.message || '').trim();
+  const normalized = normalizeNotificationText(message);
+  const prefix = [ENTRY_REQUEST_PREFIX, ENTRY_AUTHORIZED_PREFIX, ENTRY_WAIT_PREFIX, ENTRY_CANCEL_PREFIX]
+    .find(value => normalized.startsWith(normalizeNotificationText(value)));
+  if (!prefix) return message || 'Agendamento cancelado';
+  return message.slice(prefix.length).trim() || message;
+}
+
+function isEntryResponseNotification(item) {
+  return ENTRY_RESPONSE_TYPES.includes(getAppointmentNotificationType(item));
+}
+
+function isStoreVisibleAppointmentNotification(item) {
+  const type = getAppointmentNotificationType(item);
+  return type === 'appointment_cancelled' || ENTRY_RESPONSE_TYPES.includes(type);
+}
+
+function getAppointmentNotificationTitle(item) {
+  const type = getAppointmentNotificationType(item);
+  const titles = {
+    appointment_cancelled: 'Agendamento cancelado',
+    entry_requested: 'Solicitacao enviada',
+    entry_authorized: 'Entrada autorizada',
+    entry_wait: 'Aguardar cliente',
+    entry_cancel: 'Cancelar agendamento',
+  };
+  return titles[type] || 'Notificacao';
 }
 
 function labelStatus(value) {
