@@ -1,9 +1,10 @@
 const WEEKDAYS = ['DOMINGO', 'SEGUNDA-FEIRA', 'TERCA-FEIRA', 'QUARTA-FEIRA', 'QUINTA-FEIRA', 'SEXTA-FEIRA', 'SABADO'];
 const MONTHS = ['JANEIRO', 'FEVEREIRO', 'MARCO', 'ABRIL', 'MAIO', 'JUNHO', 'JULHO', 'AGOSTO', 'SETEMBRO', 'OUTUBRO', 'NOVEMBRO', 'DEZEMBRO'];
 const DEFAULT_COLORS = ['#ef4444', '#2563eb', '#16a34a', '#c084fc', '#f59e0b', '#0891b2', '#db2777', '#475569'];
+const MONDAY_TIMES = ['09:00', '09:30', '10:00', '10:30', '11:00', '11:30', '12:00'];
 const SATURDAY_TIMES = ['09:00', '09:30', '10:00', '10:30', '11:00', '11:30', '12:00', '12:30'];
 const FRIDAY_TIMES = ['14:00', '14:30', '15:00', '15:30', '16:00', '16:30', '17:00', '17:30'];
-const WEEKDAY_TIMES = [
+const TUESDAY_TO_THURSDAY_TIMES = [
   '08:00', '08:30', '09:00', '09:30', '10:00', '10:30',
   '11:00', '11:30', '12:00', '12:30', '13:00', '13:30',
   '14:00', '14:30', '15:00', '15:30', '16:00', '16:30',
@@ -1213,6 +1214,11 @@ const DB = {
   },
 
   async saveAppointment(payload) {
+    const appointmentTime = normalizeTime(payload.time);
+    if (!getTimesForDate(parseLocalDate(payload.date)).includes(appointmentTime)) {
+      throw new Error('Horario fora da grade do dia');
+    }
+
     const client = await this.saveClient({
       id: payload.client_id,
       store_id: payload.store_id,
@@ -1229,7 +1235,7 @@ const DB = {
       client_name: client.name,
       client_phone: client.phone,
       date: payload.date,
-      time: normalizeTime(payload.time),
+      time: appointmentTime,
       notes: payload.notes?.trim() || null,
       status: payload.status || 'scheduled',
       created_by: this.user.id,
@@ -3323,7 +3329,7 @@ const App = {
     <form class="modal-body form-stack store-form" id="store-form">
       <div class="store-form-note">
         <i class="fas fa-calendar-day"></i>
-        <span>Segunda a quinta das 08:00 as 18:00. Sexta das 14:00 as 17:30. Sabado das 09:00 as 13:00.</span>
+        <span>Segunda das 09:00 as 12:00. Terca a quinta das 08:00 as 18:00. Sexta das 14:00 as 17:30. Sabado das 09:00 as 13:00.</span>
       </div>
       <label>Nome da loja
         <input type="text" id="store-name" placeholder="Loja Centro" value="${esc(store?.name || '')}" required>
@@ -3907,10 +3913,15 @@ function timesForStore() {
 }
 
 function getTimesForDate(date) {
+  if (isMonday(date)) return MONDAY_TIMES;
   if (isFriday(date)) return FRIDAY_TIMES;
   if (isSaturday(date)) return SATURDAY_TIMES;
   if (isSunday(date)) return [];
-  return WEEKDAY_TIMES;
+  return TUESDAY_TO_THURSDAY_TIMES;
+}
+
+function isMonday(date) {
+  return date.getDay() === 1;
 }
 
 function isFriday(date) {
