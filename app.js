@@ -846,7 +846,7 @@ const DB = {
       p_password: password || null,
     });
 
-    if (isMissingRpcError(error)) {
+    if (isMissingRpcError(error, 'admin_update_optometrist')) {
       throw new Error('A funcao admin_update_optometrist precisa ser criada no Supabase para editar login do optometrista.');
     }
     if (error) throw error;
@@ -920,13 +920,16 @@ const DB = {
     const canSaveCurrentPrescription = ['admin', 'store'].includes(this.profile?.role);
     const canSaveNewPrescription = ['admin', 'optometrist'].includes(this.profile?.role);
     const nextCurrentPrescription = payload.current_prescription?.trim() || payload.prescription?.trim() || '';
-    const currentPrescription = current?.prescription?.trim() || '';
-    const currentPrescriptionChanged = (payload.current_prescription !== undefined || payload.prescription !== undefined)
-      && nextCurrentPrescription !== currentPrescription;
     const nextNewPrescription = payload.new_prescription?.trim() || '';
-    const currentNewPrescription = current?.new_prescription?.trim() || '';
-    const newPrescriptionChanged = payload.new_prescription !== undefined
-      && nextNewPrescription !== currentNewPrescription;
+    const prescriptionPayload = {
+      current_prescription: (payload.current_prescription !== undefined || payload.prescription !== undefined)
+        && canSaveCurrentPrescription
+        ? nextCurrentPrescription
+        : undefined,
+      new_prescription: payload.new_prescription !== undefined && canSaveNewPrescription
+        ? nextNewPrescription
+        : undefined,
+    };
 
     const clean = {
       store_id: payload.store_id,
@@ -937,22 +940,7 @@ const DB = {
       created_by: this.user.id,
     };
 
-    if ((payload.current_prescription !== undefined || payload.prescription !== undefined) && canSaveCurrentPrescription) {
-      clean.prescription = nextCurrentPrescription || null;
-      clean.prescription_updated_at = currentPrescriptionChanged ? new Date().toISOString() : current?.prescription_updated_at || null;
-      clean.prescription_updated_by = currentPrescriptionChanged ? this.user.id : current?.prescription_updated_by || null;
-    }
-
-    if (payload.new_prescription !== undefined && canSaveNewPrescription) {
-      clean.new_prescription = nextNewPrescription || null;
-      clean.new_prescription_updated_at = nextNewPrescription
-        ? (newPrescriptionChanged ? new Date().toISOString() : current?.new_prescription_updated_at || null)
-        : null;
-      clean.new_prescription_updated_by = nextNewPrescription
-        ? (newPrescriptionChanged ? this.user.id : current?.new_prescription_updated_by || null)
-        : null;
-    }
-
+    let savedClient;
     if (payload.id) {
       const { data, error } = await this.client
         .from('clients')
@@ -965,34 +953,34 @@ const DB = {
       if (!data || data.id !== payload.id) {
         throw new Error('A atualizacao nao confirmou o cliente correto. Nada foi salvo.');
       }
-      await this.notifyPrescriptionChange(data, newPrescriptionChanged);
-      await this.refresh();
-      return data;
+      savedClient = data;
+    } else {
+      const existing = this.clients.find(c => c.store_id === clean.store_id && c.phone === clean.phone);
+      if (existing) {
+        const { data, error } = await this.client
+          .from('clients')
+          .update(clean)
+          .eq('id', existing.id)
+          .select()
+          .single();
+        if (error) throw error;
+        savedClient = data;
+      } else {
+        const { data, error } = await this.client
+          .from('clients')
+          .insert(clean)
+          .select()
+          .single();
+        if (error) throw error;
+        savedClient = data;
+      }
     }
 
-    const existing = this.clients.find(c => c.store_id === clean.store_id && c.phone === clean.phone);
-    if (existing) {
-      const { data, error } = await this.client
-        .from('clients')
-        .update(clean)
-        .eq('id', existing.id)
-        .select()
-        .single();
-      if (error) throw error;
-      await this.notifyPrescriptionChange(data, newPrescriptionChanged);
-      await this.refresh();
-      return data;
+    if (prescriptionPayload.current_prescription !== undefined || prescriptionPayload.new_prescription !== undefined) {
+      savedClient = await this.saveClientPrescriptions(savedClient, prescriptionPayload);
     }
-
-    const { data, error } = await this.client
-      .from('clients')
-      .insert(clean)
-      .select()
-      .single();
-    if (error) throw error;
-    await this.notifyPrescriptionChange(data, newPrescriptionChanged);
     await this.refresh();
-    return data;
+    return savedClient;
   },
 
   async notifyPrescriptionChange(client, prescriptionChanged) {
@@ -1013,6 +1001,73 @@ const DB = {
       throw new Error('A tabela prescription_notifications ainda nao existe. Execute o SQL de receitas no Supabase.');
     }
     if (error) throw error;
+  },
+
+  async saveClientPrescriptions(client, payload) {
+    if (!client?.id) {
+      throw new Error('Cliente nao confirmado para salvar a receita.');
+    }
+
+    const updateCurrent = payload.current_prescription !== undefined;
+    const updateNew = payload.new_prescription !== undefined;
+    if (!updateCurrent && !updateNew) return client;
+
+    const nextNewPrescription = payload.new_prescription?.trim() || '';
+    const newPrescriptionChanged = updateNew
+      && nextNewPrescription !== (client.new_prescription?.trim() || '');
+    const { data, error } = await this.client.rpc('save_client_prescriptions', {
+      p_client_id: client.id,
+      p_update_current: updateCurrent,
+      p_current_prescription: updateCurrent ? payload.current_prescription?.trim() || null : null,
+      p_update_new: updateNew,
+      p_new_prescription: updateNew ? nextNewPrescription || null : null,
+    });
+
+    if (isMissingRpcError(error, 'save_client_prescriptions')) {
+      throw new Error('Execute novamente o SQL de protecao de receitas no Supabase antes de salvar.');
+    }
+    if (error) throw error;
+    if (!data?.id || data.id !== client.id) {
+      throw new Error('O banco nao confirmou o cliente correto. A receita nao foi salva.');
+    }
+
+    await this.notifyPrescriptionChange(data, newPrescriptionChanged);
+    return data;
+  },
+
+  async saveAppointmentPrescriptions(appointmentId, payload) {
+    const appointment = this.appointments.find(item => item.id === appointmentId);
+    const currentClient = appointment ? this.getAppointmentClient(appointment) : null;
+    if (!appointment || !currentClient) {
+      throw new Error('Nao foi possivel confirmar o paciente desta receita.');
+    }
+
+    const updateCurrent = payload.current_prescription !== undefined;
+    const updateNew = payload.new_prescription !== undefined;
+    if (!updateCurrent && !updateNew) return currentClient;
+
+    const previousNewPrescription = currentClient.new_prescription?.trim() || '';
+    const nextNewPrescription = payload.new_prescription?.trim() || '';
+    const newPrescriptionChanged = updateNew && previousNewPrescription !== nextNewPrescription;
+    const { data, error } = await this.client.rpc('save_appointment_prescriptions', {
+      p_appointment_id: appointmentId,
+      p_update_current: updateCurrent,
+      p_current_prescription: updateCurrent ? payload.current_prescription?.trim() || null : null,
+      p_update_new: updateNew,
+      p_new_prescription: updateNew ? nextNewPrescription || null : null,
+    });
+
+    if (isMissingRpcError(error, 'save_appointment_prescriptions')) {
+      throw new Error('Execute novamente o SQL de isolamento de receitas no Supabase antes de salvar.');
+    }
+    if (error) throw error;
+    if (!data?.id || data.id !== currentClient.id) {
+      throw new Error('O banco nao confirmou o paciente correto. A receita nao foi salva.');
+    }
+
+    await this.notifyPrescriptionChange(data, newPrescriptionChanged);
+    await this.refresh();
+    return data;
   },
 
   async notifyAppointmentCancelled(appointment) {
@@ -1263,14 +1318,18 @@ const DB = {
       throw new Error('Vinculo do cliente inconsistente. Salvamento bloqueado para proteger as receitas.');
     }
 
+    const prescriptionPayload = currentAppointment ? {
+      current_prescription: payload.client_current_prescription,
+      new_prescription: payload.client_new_prescription,
+    } : null;
     const client = await this.saveClient({
       id: resolvedClient?.id || payload.client_id,
       store_id: payload.store_id,
       name: payload.client_name,
       phone: payload.client_phone,
       notes: payload.client_notes,
-      current_prescription: payload.client_current_prescription,
-      new_prescription: payload.client_new_prescription,
+      current_prescription: currentAppointment ? undefined : payload.client_current_prescription,
+      new_prescription: currentAppointment ? undefined : payload.client_new_prescription,
     });
 
     const clean = {
@@ -1293,6 +1352,9 @@ const DB = {
         .select()
         .single();
       if (error) throw error;
+      if (prescriptionPayload) {
+        await this.saveAppointmentPrescriptions(data.id, prescriptionPayload);
+      }
       await this.refresh();
       return data;
     }
@@ -4094,10 +4156,10 @@ function formatPrescriptionInput(value, field, forcedSign = '', inputType = '') 
   return `${sign}${integer},${cents}`;
 }
 
-function isMissingRpcError(error) {
+function isMissingRpcError(error, functionName = 'admin_update_store') {
   const message = String(error?.message || '');
   return error?.code === 'PGRST202'
-    || message.includes('Could not find the function public.admin_update_store')
+    || message.includes(`Could not find the function public.${functionName}`)
     || message.includes('schema cache');
 }
 
