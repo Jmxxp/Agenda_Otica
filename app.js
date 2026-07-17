@@ -658,6 +658,27 @@ const DB = {
     return this.clients.find(client => client.id === id);
   },
 
+  getAppointmentClient(appointment) {
+    if (!appointment?.store_id) return null;
+
+    const appointmentPhone = onlyDigits(appointment.client_phone);
+    const linkedClient = appointment.client_id ? this.getClient(appointment.client_id) : null;
+    const linkedClientMatches = linkedClient
+      && linkedClient.store_id === appointment.store_id
+      && appointmentPhone
+      && onlyDigits(linkedClient.phone) === appointmentPhone;
+
+    if (linkedClientMatches) return linkedClient;
+    if (!appointmentPhone) return null;
+
+    const matchingClients = this.clients.filter(client => {
+      return client.store_id === appointment.store_id
+        && onlyDigits(client.phone) === appointmentPhone;
+    });
+
+    return matchingClients.length === 1 ? matchingClients[0] : null;
+  },
+
   getOptometrist(id) {
     return this.optometrists.find(profile => profile.id === id);
   },
@@ -889,6 +910,13 @@ const DB = {
 
   async saveClient(payload) {
     const current = payload.id ? this.getClient(payload.id) : null;
+    if (payload.id && !current) {
+      throw new Error('Cliente nao encontrado. Atualize a pagina antes de salvar.');
+    }
+    if (current && payload.store_id !== current.store_id) {
+      throw new Error('O cliente nao pertence a esta loja. Salvamento bloqueado por seguranca.');
+    }
+
     const canSaveCurrentPrescription = ['admin', 'store'].includes(this.profile?.role);
     const canSaveNewPrescription = ['admin', 'optometrist'].includes(this.profile?.role);
     const nextCurrentPrescription = payload.current_prescription?.trim() || payload.prescription?.trim() || '';
@@ -930,9 +958,13 @@ const DB = {
         .from('clients')
         .update(clean)
         .eq('id', payload.id)
+        .eq('store_id', current.store_id)
         .select()
         .single();
       if (error) throw error;
+      if (!data || data.id !== payload.id) {
+        throw new Error('A atualizacao nao confirmou o cliente correto. Nada foi salvo.');
+      }
       await this.notifyPrescriptionChange(data, newPrescriptionChanged);
       await this.refresh();
       return data;
@@ -1219,8 +1251,20 @@ const DB = {
       throw new Error('Horario fora da grade do dia');
     }
 
+    const currentAppointment = payload.id
+      ? this.appointments.find(appointment => appointment.id === payload.id)
+      : null;
+    if (payload.id && !currentAppointment) {
+      throw new Error('Agendamento nao encontrado. Atualize a pagina antes de salvar.');
+    }
+
+    const resolvedClient = currentAppointment ? this.getAppointmentClient(currentAppointment) : null;
+    if (currentAppointment && (!resolvedClient || payload.client_id !== resolvedClient.id)) {
+      throw new Error('Vinculo do cliente inconsistente. Salvamento bloqueado para proteger as receitas.');
+    }
+
     const client = await this.saveClient({
-      id: payload.client_id,
+      id: resolvedClient?.id || payload.client_id,
       store_id: payload.store_id,
       name: payload.client_name,
       phone: payload.client_phone,
@@ -2772,9 +2816,7 @@ const App = {
     const apt = DB.appointments.find(row => row.id === id);
     if (!apt) return;
     const store = DB.getStore(apt.store_id);
-    const client = DB.getClient(apt.client_id)
-      || DB.clients.find(row => row.store_id === apt.store_id && row.phone === apt.client_phone)
-      || null;
+    const client = DB.getAppointmentClient(apt);
     const canEdit = DB.canManageStore(apt.store_id);
     const canViewPrescription = Boolean(client && DB.canManageStore(client.store_id));
     const currentTime = normalizeTime(apt.time);
@@ -2875,15 +2917,15 @@ const App = {
       event.preventDefault();
       const payload = {
         id: apt.id,
-        client_id: apt.client_id,
+        client_id: client?.id || null,
         store_id: apt.store_id,
         date: document.getElementById('apt-date').value,
         time: document.getElementById('apt-time').value,
         client_name: document.getElementById('apt-client').value.trim(),
         client_phone: document.getElementById('apt-phone').value,
         notes: document.getElementById('apt-notes').value,
-        client_current_prescription: canEditCurrentPrescription ? serializePrescription(this.readPrescriptionGrid('current')) : undefined,
-        client_new_prescription: canEditNewPrescription ? serializePrescription(this.readPrescriptionGrid('new')) : undefined,
+        client_current_prescription: canEditCurrentPrescription ? serializePrescription(this.readPrescriptionGrid('current', event.currentTarget)) : undefined,
+        client_new_prescription: canEditNewPrescription ? serializePrescription(this.readPrescriptionGrid('new', event.currentTarget)) : undefined,
         status: apt.status || 'scheduled',
       };
       if (this.hasAppointmentConflict(payload, apt.id)) {
@@ -3095,8 +3137,8 @@ const App = {
           phone: document.getElementById('client-phone').value,
           email: '',
           notes: document.getElementById('client-notes').value,
-          current_prescription: canEditCurrentPrescription ? serializePrescription(this.readPrescriptionGrid('current')) : undefined,
-          new_prescription: canEditNewPrescription ? serializePrescription(this.readPrescriptionGrid('new')) : undefined,
+          current_prescription: canEditCurrentPrescription ? serializePrescription(this.readPrescriptionGrid('current', event.currentTarget)) : undefined,
+          new_prescription: canEditNewPrescription ? serializePrescription(this.readPrescriptionGrid('new', event.currentTarget)) : undefined,
         });
         this.closeModal();
         this.render();
@@ -3193,12 +3235,12 @@ const App = {
       </div>`;
   },
 
-  readPrescriptionGrid(kind) {
+  readPrescriptionGrid(kind, scope = document) {
     const prescription = emptyPrescription();
-    document.querySelectorAll(`[data-rx-kind="${kind}"][data-rx-distance][data-rx-eye][data-rx-field]`).forEach(input => {
+    scope.querySelectorAll(`[data-rx-kind="${kind}"][data-rx-distance][data-rx-eye][data-rx-field]`).forEach(input => {
       prescription[input.dataset.rxDistance][input.dataset.rxEye][input.dataset.rxField] = input.value.trim();
     });
-    const addition = document.querySelector(`[data-rx-kind="${kind}"][data-rx-addition]`);
+    const addition = scope.querySelector(`[data-rx-kind="${kind}"][data-rx-addition]`);
     if (addition) prescription.addition = addition.value.trim();
     return prescription;
   },
@@ -3458,7 +3500,7 @@ const App = {
   bindPrescriptionPrint(scope) {
     scope.querySelectorAll('[data-print-prescription]').forEach(button => {
       button.addEventListener('click', () => {
-        const prescription = this.readPrescriptionGrid('new');
+        const prescription = this.readPrescriptionGrid('new', button.closest('.prescription-grid-field') || scope);
         if (isPrescriptionEmpty(prescription)) {
           this.toast('Preencha a nova receita antes de imprimir', 'error');
           return;
