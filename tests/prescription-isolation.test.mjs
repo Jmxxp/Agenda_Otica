@@ -8,6 +8,10 @@ const isolationSql = await readFile(
   new URL('../supabase_fix_prescription_client_isolation.sql', import.meta.url),
   'utf8',
 );
+const appointmentPhoneGuardSql = await readFile(
+  new URL('../supabase_block_duplicate_appointment_phone.sql', import.meta.url),
+  'utf8',
+);
 
 function loadApp() {
   const context = vm.createContext({
@@ -63,6 +67,108 @@ test('vinculo ambiguo e bloqueado em vez de escolher qualquer pessoa', () => {
   });
 
   assert.equal(resolved, null);
+});
+
+test('novo agendamento bloqueia telefone que pertence a outra pessoa', async () => {
+  const DB = loadApp();
+  DB.clients = [{
+    id: 'cliente-1',
+    store_id: 'loja-1',
+    name: 'Pessoa A',
+    phone: '(11) 91111-1111',
+  }];
+  DB.appointments = [];
+
+  const conflict = DB.findAppointmentPhoneConflict({
+    store_id: 'loja-1',
+    client_name: 'Pessoa B',
+    client_phone: '11911111111',
+  });
+
+  assert.equal(conflict?.type, 'client');
+  assert.equal(conflict?.name, 'Pessoa A');
+  await assert.rejects(
+    DB.saveAppointment({
+      store_id: 'loja-1',
+      client_name: 'Pessoa B',
+      client_phone: '11911111111',
+      date: '2026-07-21',
+      time: '08:00',
+    }),
+    /Este telefone já está vinculado a Pessoa A/,
+  );
+});
+
+test('mesma pessoa pode usar novamente o proprio telefone', () => {
+  const DB = loadApp();
+  DB.clients = [{
+    id: 'cliente-1',
+    store_id: 'loja-1',
+    name: 'João da Silva',
+    phone: '11922222222',
+  }];
+  DB.appointments = [{
+    id: 'agendamento-antigo',
+    client_id: 'cliente-1',
+    store_id: 'loja-1',
+    client_name: 'João da Silva',
+    client_phone: '11922222222',
+  }];
+
+  const conflict = DB.findAppointmentPhoneConflict({
+    store_id: 'loja-1',
+    client_name: '  JOAO   DA SILVA ',
+    client_phone: '(11) 92222-2222',
+  });
+
+  assert.equal(conflict, null);
+});
+
+test('edicao nao permite trocar a pessoa mantendo o mesmo telefone', () => {
+  const DB = loadApp();
+  DB.clients = [{
+    id: 'cliente-1',
+    store_id: 'loja-1',
+    name: 'Pessoa Original',
+    phone: '11933333333',
+  }];
+  DB.appointments = [{
+    id: 'agendamento-1',
+    client_id: 'cliente-1',
+    store_id: 'loja-1',
+    client_name: 'Pessoa Original',
+    client_phone: '11933333333',
+  }];
+
+  const conflict = DB.findAppointmentPhoneConflict({
+    id: 'agendamento-1',
+    client_id: 'cliente-1',
+    store_id: 'loja-1',
+    client_name: 'Outra Pessoa',
+    client_phone: '11933333333',
+  }, 'agendamento-1');
+
+  assert.equal(conflict?.type, 'client');
+  assert.equal(conflict?.name, 'Pessoa Original');
+});
+
+test('telefone igual em outra loja nao mistura os cadastros', () => {
+  const DB = loadApp();
+  DB.clients = [{
+    id: 'cliente-loja-1',
+    store_id: 'loja-1',
+    name: 'Pessoa A',
+    phone: '11944444444',
+  }];
+  DB.appointments = [];
+
+  const conflict = DB.findAppointmentPhoneConflict({
+    store_id: 'loja-2',
+    client_name: 'Pessoa B',
+    client_phone: '11944444444',
+  });
+
+  assert.equal(conflict, null);
 });
 
 test('update de cliente exige id e loja do paciente alvo', async () => {
@@ -279,4 +385,12 @@ test('SQL bloqueia escrita direta, telefone duplicado e registra auditoria', () 
   assert.match(isolationSql, /create table if not exists public\.prescription_change_audit/);
   assert.match(isolationSql, /create trigger audit_client_prescription_change/);
   assert.match(isolationSql, /set_config\('app\.prescription_write_guard', 'allowed', true\)/);
+});
+
+test('SQL reforca no banco o dono do telefone do agendamento', () => {
+  assert.match(appointmentPhoneGuardSql, /create trigger enforce_appointment_phone_owner/);
+  assert.match(appointmentPhoneGuardSql, /create trigger enforce_unique_client_phone/);
+  assert.match(appointmentPhoneGuardSql, /clients_store_phone_digits_unique/);
+  assert.match(appointmentPhoneGuardSql, /normalize_person_name/);
+  assert.match(appointmentPhoneGuardSql, /Este telefone ja esta vinculado a/);
 });

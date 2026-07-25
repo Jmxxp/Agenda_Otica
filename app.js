@@ -679,6 +679,53 @@ const DB = {
     return matchingClients.length === 1 ? matchingClients[0] : null;
   },
 
+  findAppointmentPhoneConflict(payload, ignoreAppointmentId = payload?.id || null) {
+    const storeId = payload?.store_id;
+    const phone = onlyDigits(payload?.client_phone ?? payload?.phone);
+    const name = normalizePersonName(payload?.client_name ?? payload?.name);
+    const clientId = payload?.client_id || null;
+    if (!storeId || !phone || !name) return null;
+
+    const matchingClients = this.clients.filter(client => {
+      return client.store_id === storeId && onlyDigits(client.phone) === phone;
+    });
+
+    if (matchingClients.length > 1) {
+      return {
+        type: 'ambiguous',
+        name: matchingClients[0]?.name || '',
+      };
+    }
+
+    const phoneOwner = matchingClients[0];
+    if (phoneOwner) {
+      const belongsToCurrentClient = clientId && phoneOwner.id === clientId;
+      const belongsToSameName = normalizePersonName(phoneOwner.name) === name;
+      if (!belongsToSameName || (clientId && !belongsToCurrentClient)) {
+        return {
+          type: 'client',
+          name: phoneOwner.name || '',
+        };
+      }
+    }
+
+    const conflictingAppointment = this.appointments.find(appointment => {
+      return appointment.id !== ignoreAppointmentId
+        && appointment.store_id === storeId
+        && onlyDigits(appointment.client_phone) === phone
+        && normalizePersonName(appointment.client_name) !== name;
+    });
+
+    if (conflictingAppointment) {
+      return {
+        type: 'appointment',
+        name: conflictingAppointment.client_name || '',
+      };
+    }
+
+    return null;
+  },
+
   getOptometrist(id) {
     return this.optometrists.find(profile => profile.id === id);
   },
@@ -940,6 +987,21 @@ const DB = {
       created_by: this.user.id,
     };
 
+    const phoneOwners = this.clients.filter(client => {
+      return client.store_id === clean.store_id
+        && onlyDigits(client.phone) === clean.phone
+        && client.id !== current?.id;
+    });
+    if (phoneOwners.length > 1) {
+      throw new Error(appointmentPhoneConflictMessage({ type: 'ambiguous' }));
+    }
+    if (phoneOwners[0] && (payload.id || normalizePersonName(phoneOwners[0].name) !== normalizePersonName(clean.name))) {
+      throw new Error(appointmentPhoneConflictMessage({
+        type: 'client',
+        name: phoneOwners[0].name,
+      }));
+    }
+
     let savedClient;
     if (payload.id) {
       const { data, error } = await this.client
@@ -955,7 +1017,7 @@ const DB = {
       }
       savedClient = data;
     } else {
-      const existing = this.clients.find(c => c.store_id === clean.store_id && c.phone === clean.phone);
+      const existing = phoneOwners[0];
       if (existing) {
         const { data, error } = await this.client
           .from('clients')
@@ -1311,6 +1373,11 @@ const DB = {
       : null;
     if (payload.id && !currentAppointment) {
       throw new Error('Agendamento nao encontrado. Atualize a pagina antes de salvar.');
+    }
+
+    const phoneConflict = this.findAppointmentPhoneConflict(payload, currentAppointment?.id || null);
+    if (phoneConflict) {
+      throw new Error(appointmentPhoneConflictMessage(phoneConflict));
     }
 
     const resolvedClient = currentAppointment ? this.getAppointmentClient(currentAppointment) : null;
@@ -2809,7 +2876,11 @@ const App = {
         </datalist>
       </label>
       <label>Telefone
-        <input type="tel" id="apt-phone" placeholder="19912345678" required>
+        <input type="tel" id="apt-phone" placeholder="19912345678" aria-describedby="apt-phone-feedback" required>
+        <small class="appointment-phone-feedback hidden" id="apt-phone-feedback" role="alert">
+          <i class="fas fa-circle-exclamation"></i>
+          <span></span>
+        </small>
       </label>
       <label>Observacoes
         <textarea id="apt-notes" placeholder="Opcional"></textarea>
@@ -2822,6 +2893,8 @@ const App = {
 
     const storeField = document.getElementById('apt-store');
     const dateField = document.getElementById('apt-date');
+    const appointmentForm = document.getElementById('appointment-form');
+    const validatePhoneIdentity = this.bindAppointmentPhoneGuard(appointmentForm);
 
     if (storeField.tagName === 'SELECT') storeField.onchange = event => {
       const selected = DB.getStore(event.target.value);
@@ -2844,11 +2917,18 @@ const App = {
       if (client) {
         document.getElementById('apt-phone').value = this.fmtPhone(client.phone);
       }
+      validatePhoneIdentity();
     };
 
-    document.getElementById('appointment-form').onsubmit = async event => {
+    appointmentForm.onsubmit = async event => {
       event.preventDefault();
       const payload = this.readAppointmentForm();
+      const phoneConflict = validatePhoneIdentity();
+      if (phoneConflict) {
+        this.toast(appointmentPhoneConflictMessage(phoneConflict), 'error');
+        document.getElementById('apt-phone').focus();
+        return;
+      }
       if (isSunday(parseLocalDate(payload.date))) {
         this.toast('Fechado aos domingos', 'error');
         return;
@@ -2924,7 +3004,11 @@ const App = {
         <input type="text" id="apt-client" value="${esc(apt.client_name)}" ${canEdit ? '' : 'disabled'}>
       </label>
       <label>Telefone
-        <input type="tel" id="apt-phone" value="${this.fmtPhone(apt.client_phone)}" ${canEdit ? '' : 'disabled'}>
+        <input type="tel" id="apt-phone" value="${this.fmtPhone(apt.client_phone)}" aria-describedby="apt-phone-feedback" ${canEdit ? '' : 'disabled'}>
+        <small class="appointment-phone-feedback hidden" id="apt-phone-feedback" role="alert">
+          <i class="fas fa-circle-exclamation"></i>
+          <span></span>
+        </small>
       </label>
       <label>Observacoes
         <textarea id="apt-notes" ${canEdit ? '' : 'disabled'}>${esc(apt.notes || '')}</textarea>
@@ -2937,6 +3021,15 @@ const App = {
         ${canEdit ? '<button class="btn btn-primary" type="submit">Salvar</button>' : ''}
       </div>
     </form>`);
+
+    const appointmentDetailForm = document.getElementById('appointment-detail-form');
+    const validatePhoneIdentity = canEdit
+      ? this.bindAppointmentPhoneGuard(appointmentDetailForm, {
+        ignoreAppointmentId: apt.id,
+        clientId: client?.id || null,
+        storeId: apt.store_id,
+      })
+      : () => null;
 
     if (canEdit) {
       document.getElementById('apt-date')?.addEventListener('change', event => {
@@ -2975,7 +3068,7 @@ const App = {
       }
     });
 
-    document.getElementById('appointment-detail-form').onsubmit = async event => {
+    appointmentDetailForm.onsubmit = async event => {
       event.preventDefault();
       const payload = {
         id: apt.id,
@@ -2990,6 +3083,12 @@ const App = {
         client_new_prescription: canEditNewPrescription ? serializePrescription(this.readPrescriptionGrid('new', event.currentTarget)) : undefined,
         status: apt.status || 'scheduled',
       };
+      const phoneConflict = validatePhoneIdentity();
+      if (phoneConflict) {
+        this.toast(appointmentPhoneConflictMessage(phoneConflict), 'error');
+        document.getElementById('apt-phone').focus();
+        return;
+      }
       if (this.hasAppointmentConflict(payload, apt.id)) {
         this.toast('Este horario ja esta ocupado', 'error');
         return;
@@ -3531,6 +3630,42 @@ const App = {
     return this.isAppointmentSlotTaken(payload.date, payload.time, ignoreId);
   },
 
+  bindAppointmentPhoneGuard(form, options = {}) {
+    const nameField = form?.querySelector('#apt-client');
+    const phoneField = form?.querySelector('#apt-phone');
+    const storeField = form?.querySelector('#apt-store');
+    const feedback = form?.querySelector('#apt-phone-feedback');
+    const feedbackText = feedback?.querySelector('span');
+    const submitButton = form?.querySelector('button[type="submit"]');
+    if (!nameField || !phoneField || !feedback || !feedbackText) return () => null;
+
+    const validate = () => {
+      const conflict = DB.findAppointmentPhoneConflict({
+        id: options.ignoreAppointmentId || null,
+        client_id: options.clientId || null,
+        store_id: storeField?.value || options.storeId,
+        client_name: nameField.value,
+        client_phone: phoneField.value,
+      }, options.ignoreAppointmentId || null);
+      const message = conflict ? appointmentPhoneConflictMessage(conflict) : '';
+
+      phoneField.setAttribute('aria-invalid', conflict ? 'true' : 'false');
+      feedback.classList.toggle('hidden', !conflict);
+      feedbackText.textContent = message;
+      if (submitButton) {
+        submitButton.disabled = Boolean(conflict);
+        submitButton.title = message;
+      }
+      return conflict;
+    };
+
+    nameField.addEventListener('input', validate);
+    phoneField.addEventListener('input', validate);
+    storeField?.addEventListener('change', validate);
+    validate();
+    return validate;
+  },
+
   openModal(html, options = {}) {
     this.closeModal();
     const overlay = document.createElement('div');
@@ -3976,6 +4111,26 @@ function esc(value) {
 
 function onlyDigits(value) {
   return String(value || '').replace(/\D/g, '');
+}
+
+function normalizePersonName(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/\s+/g, ' ');
+}
+
+function appointmentPhoneConflictMessage(conflict) {
+  if (conflict?.type === 'ambiguous') {
+    return 'Este telefone está duplicado nos clientes. Corrija os cadastros antes de agendar.';
+  }
+
+  const ownerName = String(conflict?.name || '').trim();
+  return ownerName
+    ? `Este telefone já está vinculado a ${ownerName}. Use outro número para este cliente.`
+    : 'Este telefone já está vinculado a outra pessoa. Use outro número para este cliente.';
 }
 
 function normalizeNick(value) {

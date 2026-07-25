@@ -70,6 +70,37 @@ textarea { min-height: 82px; resize: vertical; }
 label { display: grid; gap: 7px; color: var(--text2); font-size: .82rem; font-weight: 700; text-transform: uppercase; }
 .hidden { display: none !important; }
 
+.appointment-phone-feedback {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  padding: 9px 10px;
+  border: 1px solid color-mix(in srgb, var(--red) 34%, transparent);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--red) 9%, var(--bg2));
+  color: var(--red);
+  font-size: .76rem;
+  font-weight: 750;
+  line-height: 1.4;
+  text-transform: none;
+}
+
+.appointment-phone-feedback i {
+  margin-top: 2px;
+}
+
+#apt-phone[aria-invalid="true"] {
+  border-color: var(--red);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--red) 16%, transparent);
+}
+
+.modal-foot .btn:disabled {
+  cursor: not-allowed;
+  opacity: .5;
+  box-shadow: none;
+  transform: none;
+}
+
 .password-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 42px;
