@@ -583,6 +583,7 @@ label { display: grid; gap: 7px; color: var(--text2); font-size: .82rem; font-we
 
 .toolbar-actions {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: flex-end;
   gap: 10px;
