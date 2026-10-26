@@ -43,6 +43,8 @@ const DB = {
   optometrists: [],
   clients: [],
   appointments: [],
+  scheduleBlocks: [],
+  scheduleBlocksAvailable: true,
   prescriptionNotifications: [],
   appointmentNotifications: [],
   prescriptionNotificationsAvailable: true,
@@ -135,6 +137,8 @@ const DB = {
     this.optometrists = [];
     this.clients = [];
     this.appointments = [];
+    this.scheduleBlocks = [];
+    this.scheduleBlocksAvailable = true;
     this.prescriptionNotifications = [];
     this.appointmentNotifications = [];
     this.prescriptionNotificationsAvailable = true;
@@ -146,11 +150,12 @@ const DB = {
     const profile = this.user ? await this.getProfile() : null;
     if (profile) this.profile = profile;
 
-    const [storesRes, appointmentsRes, clientsRes, optometrists] = await Promise.all([
+    const [storesRes, appointmentsRes, clientsRes, optometrists, scheduleBlocks] = await Promise.all([
       this.storesQuery(),
       this.appointmentsQuery(),
       this.clientsQuery(),
       this.loadOptometrists(),
+      this.loadScheduleBlocks(),
     ]);
 
     if (storesRes.error) throw storesRes.error;
@@ -161,6 +166,7 @@ const DB = {
     this.optometrists = optometrists || [];
     this.appointments = appointmentsRes.data || [];
     this.clients = clientsRes.data || [];
+    this.scheduleBlocks = scheduleBlocks;
     this.prescriptionNotifications = await this.loadPrescriptionNotifications();
     this.appointmentNotifications = await this.loadAppointmentNotifications();
     this.lastSync = new Date();
@@ -180,6 +186,76 @@ const DB = {
       .select('*')
       .order('date', { ascending: true })
       .order('time', { ascending: true });
+  },
+
+  async loadScheduleBlocks() {
+    const blocks = [];
+    const pageSize = 500;
+    for (let offset = 0; ; offset += pageSize) {
+      const { data, error } = await this.client.from('schedule_blocks').select('*')
+        .order('start_date', { ascending: true }).order('id', { ascending: true })
+        .range(offset, offset + pageSize - 1);
+      if (isMissingTableError(error)) {
+        this.scheduleBlocksAvailable = false;
+        return [];
+      }
+      if (error) throw error;
+      blocks.push(...(data || []));
+      if (!data || data.length < pageSize) break;
+    }
+    this.scheduleBlocksAvailable = true;
+    return blocks;
+  },
+
+  getScheduleBlocks(date, storeId) {
+    if (!isValidDateKey(date)) return [];
+    return this.scheduleBlocks.filter(block => block.start_date <= date && block.end_date >= date
+      && (!block.store_id || block.store_id === storeId));
+  },
+
+  canManageScheduleBlock(block) {
+    return ['admin', 'optometrist'].includes(this.profile?.role)
+      || (this.profile?.role === 'store' && Boolean(block.store_id)
+        && block.store_id === this.profile.store_id);
+  },
+
+  async saveScheduleBlock(payload) {
+    if (!this.scheduleBlocksAvailable) {
+      throw new Error('O recurso de bloqueio de agenda precisa ser ativado pelo administrador.');
+    }
+    const storeId = payload.store_id || null;
+    if (!this.canManageScheduleBlock({ store_id: storeId })) {
+      throw new Error('Você só pode bloquear a agenda da sua loja.');
+    }
+    if (storeId && !this.getStore(storeId)) throw new Error('Selecione uma loja válida.');
+    if (!isValidDateKey(payload.start_date) || !isValidDateKey(payload.end_date)
+      || payload.end_date < payload.start_date) {
+      throw new Error('Informe um período válido. A data final deve ser igual ou posterior à inicial.');
+    }
+    const reason = String(payload.reason || '').trim();
+    if (reason.length > 240) throw new Error('O motivo deve ter até 240 caracteres.');
+    const { data, error } = await this.client.from('schedule_blocks').insert({
+      store_id: storeId,
+      start_date: payload.start_date,
+      end_date: payload.end_date,
+      reason,
+      created_by: this.user.id,
+    }).select().single();
+    if (error) throw error;
+    this.scheduleBlocks = [...this.scheduleBlocks.filter(block => block.id !== data.id), data];
+    return data;
+  },
+
+  async removeScheduleBlock(id) {
+    const block = this.scheduleBlocks.find(item => item.id === id);
+    if (!block || !this.canManageScheduleBlock(block)) {
+      throw new Error('Você não tem permissão para remover este bloqueio.');
+    }
+    const { data, error } = await this.client.from('schedule_blocks')
+      .delete().eq('id', id).select('id');
+    if (error) throw error;
+    if (!data?.length) throw new Error('O bloqueio não foi removido. Atualize a agenda e tente novamente.');
+    this.scheduleBlocks = this.scheduleBlocks.filter(item => item.id !== id);
   },
 
   clientsQuery() {
@@ -347,6 +423,7 @@ const DB = {
       { table: 'clients', filter: storeFilter('store_id') },
       { table: 'appointments', filter: null },
     ];
+    if (this.scheduleBlocksAvailable) tableChanges.push({ table: 'schedule_blocks', filter: null });
     if (this.prescriptionNotificationsAvailable) {
       tableChanges.push({ table: 'prescription_notifications', filter: storeFilter('store_id') });
     }
@@ -477,6 +554,17 @@ const DB = {
   },
 
   handleRealtimePayload(table, payload) {
+    if (table === 'schedule_blocks') {
+      const incoming = payload.eventType === 'DELETE' ? payload.old : payload.new;
+      if (!incoming?.id) return;
+      this.scheduleBlocks = this.scheduleBlocks.filter(block => block.id !== incoming.id);
+      if (payload.eventType !== 'DELETE' && (['admin', 'optometrist'].includes(this.profile?.role)
+        || !incoming.store_id || incoming.store_id === this.profile?.store_id)) {
+        this.scheduleBlocks.push(incoming);
+      }
+      App.renderScheduleBlockList?.();
+      return;
+    }
     if (table === 'appointments') {
       this.handleAppointmentRealtime(payload);
     }
@@ -1375,6 +1463,12 @@ const DB = {
       throw new Error('Agendamento nao encontrado. Atualize a pagina antes de salvar.');
     }
 
+    const slotChanged = !currentAppointment || !sameAppointmentSlot(currentAppointment, payload)
+      || (currentAppointment.status === 'cancelled' && payload.status !== 'cancelled');
+    if (slotChanged && this.getScheduleBlocks(payload.date, payload.store_id).length) {
+      throw new Error('Agenda bloqueada para esta loja no dia escolhido. Selecione outra data ou desbloqueie o período.');
+    }
+
     const phoneConflict = this.findAppointmentPhoneConflict(payload, currentAppointment?.id || null);
     if (phoneConflict) {
       throw new Error(appointmentPhoneConflictMessage(phoneConflict));
@@ -1784,6 +1878,7 @@ const App = {
     if (this.activeView === 'clients') this.renderClients();
     else if (this.activeView === 'admin') this.renderAdmin();
     else this.renderAgenda();
+    this.renderScheduleBlockList();
   },
 
   updateAccountBadge() {
@@ -2387,7 +2482,11 @@ const App = {
       if (isToday) classes.push('today');
       if (isSelected && !isToday) classes.push('selected');
       if (daysWithApt.has(day)) classes.push('has-apt');
-      html += `<button class="${classes.join(' ')}" data-day="${day}">${day}</button>`;
+      const dateKey = this.fmtDate(new Date(y, m, day));
+      const hasBlock = DB.scheduleBlocks.some(block => block.start_date <= dateKey && block.end_date >= dateKey
+        && (['admin', 'optometrist'].includes(DB.profile?.role) || !block.store_id || block.store_id === DB.profile?.store_id));
+      if (hasBlock) classes.push('has-block');
+      html += `<button class="${classes.join(' ')}" data-day="${day}" ${hasBlock ? 'title="Há bloqueio de agenda neste dia"' : ''}>${day}</button>`;
     }
 
     const total = first + days;
@@ -2405,22 +2504,189 @@ const App = {
     });
   },
 
+  getSchedulableStores(date) {
+    return DB.stores.filter(store => DB.canManageStore(store.id)
+      && !DB.getScheduleBlocks(date, store.id).length);
+  },
+
+  renderScheduleToolbar() {
+    const date = this.fmtDate(this.selDate);
+    const blocks = DB.scheduleBlocks.filter(block => block.start_date <= date && block.end_date >= date
+      && (['admin', 'optometrist'].includes(DB.profile?.role) || !block.store_id || block.store_id === DB.profile?.store_id));
+    const allBlocked = blocks.some(block => !block.store_id);
+    const storeNames = [...new Set(blocks.filter(block => block.store_id)
+      .map(block => DB.getStore(block.store_id)?.name || 'Loja'))];
+    return `<div class="schedule-toolbar">
+      <div class="schedule-toolbar-copy"><h2>Agenda</h2><p>Atendimentos e disponibilidade das lojas.</p></div>
+      <button class="btn btn-secondary" type="button" data-manage-schedule-blocks><i class="fas fa-lock" aria-hidden="true"></i> Bloquear agenda</button>
+    </div>${blocks.length ? `<div class="schedule-block-summary" role="status">
+      <i class="fas fa-lock" aria-hidden="true"></i>
+      <div><strong>${allBlocked ? 'Agenda bloqueada para todas as lojas' : `Agenda bloqueada: ${esc(storeNames.join(', '))}`}</strong>
+      <small>Sem novos agendamentos neste dia. Os atendimentos já marcados estão mantidos.</small></div>
+      <button class="btn btn-secondary" type="button" data-manage-schedule-blocks>Gerenciar</button>
+    </div>` : ''}`;
+  },
+
+  bindScheduleToolbar(scope) {
+    scope.querySelectorAll('[data-manage-schedule-blocks]').forEach(button => {
+      button.addEventListener('click', () => this.openScheduleBlocksModal());
+    });
+  },
+
+  openScheduleBlocksModal(storeId = null) {
+    const isManager = ['admin', 'optometrist'].includes(DB.profile?.role);
+    if (!isManager && DB.profile?.role !== 'store') return;
+    const selectedStore = isManager ? (storeId || '') : DB.profile.store_id;
+    const date = this.fmtDate(this.selDate);
+    this.openModal(`<div class="modal-head">
+      <h3 id="schedule-block-title">Bloqueios da agenda</h3>
+      <button class="modal-close" type="button" aria-label="Fechar">&times;</button>
+    </div>
+    <div class="modal-body form-stack">
+      <p class="schedule-block-intro">Escolha os dias em que a agenda ficará fechada para novos agendamentos. Você pode desbloquear o período quando precisar.</p>
+      ${DB.scheduleBlocksAvailable ? '' : '<p class="schedule-block-error" role="alert">O recurso de bloqueio de agenda precisa ser ativado pelo administrador.</p>'}
+      <form class="form-stack schedule-block-form" id="schedule-block-form">
+        ${isManager ? `<label>Bloquear para
+          <select id="block-store"><option value="">Todas as lojas</option>${DB.stores.map(store => `<option value="${esc(store.id)}" ${store.id === selectedStore ? 'selected' : ''}>${esc(store.name)}</option>`).join('')}</select>
+        </label>` : `<input type="hidden" id="block-store" value="${esc(selectedStore || '')}"><p class="schedule-block-note"><i class="fas fa-store" aria-hidden="true"></i> ${esc(DB.getStore(selectedStore)?.name || 'Sua loja')}</p>`}
+        <div class="field-row">
+          <label>De<input id="block-start" type="date" value="${date}" required></label>
+          <label>Até<input id="block-end" type="date" value="${date}" min="${date}" required></label>
+        </div>
+        <label>Motivo <span>(opcional)</span><input id="block-reason" type="text" placeholder="Ex.: férias ou ausência do profissional" maxlength="240"></label>
+        <p class="schedule-block-note" id="block-existing-note"></p>
+        <p class="schedule-block-error hidden" id="block-error" role="alert"></p>
+        <div class="modal-foot"><button class="btn btn-primary" type="submit" ${DB.scheduleBlocksAvailable ? '' : 'disabled'}><i class="fas fa-lock" aria-hidden="true"></i> Bloquear período</button></div>
+      </form>
+      <section aria-label="Períodos bloqueados"><h4>Períodos bloqueados</h4><div class="schedule-block-list" id="schedule-block-list"></div></section>
+    </div>`, { boxClass: 'schedule-block-modal' });
+    const modal = document.getElementById('modal');
+    modal.dataset.scheduleBlocks = '1';
+    const box = modal.querySelector('.modal-box');
+    box.setAttribute('role', 'dialog');
+    box.setAttribute('aria-modal', 'true');
+    box.setAttribute('aria-labelledby', 'schedule-block-title');
+    const form = modal.querySelector('#schedule-block-form');
+    const start = form.querySelector('#block-start');
+    const end = form.querySelector('#block-end');
+    const updateNote = () => {
+      const scopeStore = form.querySelector('#block-store').value;
+      const count = DB.appointments.filter(apt => apt.status !== 'cancelled'
+        && (!scopeStore || apt.store_id === scopeStore) && apt.date >= start.value && apt.date <= end.value).length;
+      modal.querySelector('#block-existing-note').textContent = count
+        ? `${count === 1 ? '1 agendamento neste período será mantido.' : `${count} agendamentos neste período serão mantidos.`} O bloqueio vale para novos agendamentos e remarcações.`
+        : 'As datas inicial e final estão incluídas. Agendamentos existentes serão mantidos.';
+    };
+    start.addEventListener('change', () => {
+      end.min = start.value;
+      if (end.value < start.value) end.value = start.value;
+      updateNote();
+    });
+    end.addEventListener('change', updateNote);
+    form.querySelector('#block-store').addEventListener('change', () => {
+      this.renderScheduleBlockList();
+      updateNote();
+    });
+    let saving = false;
+    form.onsubmit = async event => {
+      event.preventDefault();
+      if (saving) return;
+      saving = true;
+      const button = form.querySelector('button[type="submit"]');
+      const error = form.querySelector('#block-error');
+      error.classList.add('hidden');
+      button.disabled = true;
+      try {
+        await DB.saveScheduleBlock({
+          store_id: form.querySelector('#block-store').value || null,
+          start_date: start.value, end_date: end.value,
+          reason: form.querySelector('#block-reason').value,
+        });
+        if (modal.isConnected) {
+          form.querySelector('#block-reason').value = '';
+          this.renderScheduleBlockList();
+        }
+        this.renderCalendar();
+        if (this.activeView === 'agenda') this.renderAgenda();
+        this.toast('Período bloqueado para novos agendamentos', 'success');
+      } catch (err) {
+        error.textContent = err.message;
+        error.classList.remove('hidden');
+      } finally {
+        saving = false;
+        button.disabled = !DB.scheduleBlocksAvailable;
+      }
+    };
+    modal.addEventListener('keydown', event => {
+      if (event.key !== 'Tab') return;
+      const fields = [...modal.querySelectorAll('button:not(:disabled), input:not([type="hidden"]):not(:disabled), select:not(:disabled)')];
+      const first = fields[0];
+      const last = fields[fields.length - 1];
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+    });
+    this.renderScheduleBlockList();
+    updateNote();
+    start.focus();
+  },
+
+  renderScheduleBlockList() {
+    const list = document.getElementById('schedule-block-list');
+    if (!list) return;
+    const storeId = document.getElementById('block-store')?.value || null;
+    const today = this.fmtDate(new Date());
+    const blocks = DB.scheduleBlocks.filter(block => !storeId || !block.store_id || block.store_id === storeId)
+      .sort((a, b) => Number(a.end_date < today) - Number(b.end_date < today)
+        || a.start_date.localeCompare(b.start_date) || a.end_date.localeCompare(b.end_date));
+    list.innerHTML = blocks.length ? blocks.map(block => `<div class="schedule-block-item ${block.end_date < today ? 'is-expired' : ''}">
+      <div class="schedule-block-copy"><strong>${esc(block.store_id ? DB.getStore(block.store_id)?.name || 'Loja' : 'Todas as lojas')}</strong>
+        <small>${this.fmtDateDisplay(parseLocalDate(block.start_date))} até ${this.fmtDateDisplay(parseLocalDate(block.end_date))}${block.end_date < today ? ' · Encerrado' : ''}</small>
+        ${block.reason ? `<p>${esc(block.reason)}</p>` : ''}
+        ${DB.canManageScheduleBlock(block) ? '' : '<p>Bloqueio geral. O admin ou optometrista pode desbloquear.</p>'}
+      </div>${DB.canManageScheduleBlock(block) ? `<button class="btn btn-secondary schedule-unlock" type="button" data-unlock-block="${esc(block.id)}" ${this._pendingScheduleBlockIds?.has(block.id) ? 'disabled' : ''}><i class="fas fa-lock-open" aria-hidden="true"></i> Desbloquear</button>` : ''}
+    </div>`).join('') + '<p class="schedule-block-note">Se houver outro bloqueio no mesmo dia, ele continua valendo.</p>'
+      : '<p class="schedule-block-empty">Nenhum período bloqueado para esta seleção.</p>';
+    list.querySelectorAll('[data-unlock-block]').forEach(button => {
+      button.addEventListener('click', async () => {
+        const id = button.dataset.unlockBlock;
+        this._pendingScheduleBlockIds ||= new Set();
+        if (this._pendingScheduleBlockIds.has(id)) return;
+        this._pendingScheduleBlockIds.add(id);
+        button.disabled = true;
+        try {
+          await DB.removeScheduleBlock(id);
+          this.renderCalendar();
+          if (this.activeView === 'agenda') this.renderAgenda();
+          this.toast('Bloqueio removido', 'success');
+        } catch (err) {
+          this.toast(err.message, 'error');
+        } finally {
+          this._pendingScheduleBlockIds.delete(id);
+          this.renderScheduleBlockList();
+        }
+      });
+    });
+  },
+
   renderAgenda() {
     const content = document.getElementById('content');
     const stores = DB.stores;
     const dateStr = this.fmtDate(this.selDate);
     const isMobile = this.isMobileLayout();
+    const toolbar = this.renderScheduleToolbar();
 
     if (!stores.length) {
-      content.innerHTML = this.emptyState('fa-store', 'Nenhuma loja cadastrada', DB.profile.role === 'admin'
+      content.innerHTML = toolbar + this.emptyState('fa-store', 'Nenhuma loja cadastrada', DB.profile.role === 'admin'
         ? 'Crie a primeira loja na tela Admin.'
         : 'Peça para o administrador vincular sua conta a uma loja.');
+      this.bindScheduleToolbar(content);
       return;
     }
 
     if (isSunday(this.selDate)) {
       const empty = this.emptyState('fa-moon', 'Fechado aos domingos', 'Escolha outro dia no calendario.');
-      content.innerHTML = isMobile ? `${this.renderMobileAgendaControls()}${empty}` : empty;
+      content.innerHTML = `${isMobile ? this.renderMobileAgendaControls() : ''}${toolbar}${empty}`;
+      this.bindScheduleToolbar(content);
       if (isMobile) this.bindMobileAgendaControls(content);
       return;
     }
@@ -2442,18 +2708,20 @@ const App = {
       ? `42px repeat(${stores.length}, minmax(58px, 1fr))`
       : `76px repeat(${stores.length}, minmax(150px, 1fr))`;
 
-    let html = isMobile ? this.renderMobileAgendaControls() : '';
+    let html = `${isMobile ? this.renderMobileAgendaControls() : ''}${toolbar}`;
     html += `<div class="schedule-grid" style="grid-template-columns:${gridCols}">`;
     html += '<div class="grid-corner">Hora</div>';
     stores.forEach(store => {
-      html += `<div class="grid-store-header"><span class="dot" style="background:${store.color}"></span>${esc(store.name)}</div>`;
+      const blocked = DB.getScheduleBlocks(dateStr, store.id).length;
+      html += `<div class="grid-store-header"><span class="dot" style="background:${store.color}"></span>${esc(store.name)}${blocked ? ' <i class="fas fa-lock store-lock-icon" title="Agenda bloqueada" aria-label="Agenda bloqueada"></i>' : ''}</div>`;
     });
 
     times.forEach(time => {
       html += `<div class="grid-time">${time}</div>`;
       stores.forEach(store => {
         const apt = appointments.find(a => a.store_id === store.id && normalizeTime(a.time) === time);
-        const canAdd = DB.canManageStore(store.id) && !apt && !occupiedTimes.has(time);
+        const blocks = DB.getScheduleBlocks(dateStr, store.id);
+        const canAdd = DB.canManageStore(store.id) && !blocks.length && !apt && !occupiedTimes.has(time);
         if (apt) {
           const hasNewPrescription = this.hasUnreadPrescriptionForAppointment(apt);
           html += `<div class="grid-cell filled" data-apt-id="${apt.id}">
@@ -2464,14 +2732,15 @@ const App = {
             </div>
           </div>`;
         } else {
-          html += `<div class="grid-cell ${canAdd ? 'can-add' : ''}" data-store="${store.id}" data-time="${time}">
-            ${canAdd ? '<span class="add-icon">+</span>' : ''}
+          html += `<div class="grid-cell ${blocks.length ? 'schedule-locked' : ''} ${canAdd ? 'can-add' : ''}" data-store="${store.id}" data-time="${time}" ${blocks.length ? 'title="Agenda bloqueada para esta loja" aria-label="Agenda bloqueada"' : ''}>
+            ${blocks.length ? '<i class="fas fa-lock schedule-lock-icon" aria-hidden="true"></i>' : canAdd ? '<span class="add-icon">+</span>' : ''}
           </div>`;
         }
       });
     });
     html += '</div>';
     content.innerHTML = html;
+    this.bindScheduleToolbar(content);
     if (isMobile) this.bindMobileAgendaControls(content);
 
     content.querySelectorAll('[data-apt-id]').forEach(el => {
@@ -2533,9 +2802,11 @@ const App = {
   },
 
   renderMobileSimplifiedAgenda(content, stores, times, appointments, occupiedTimes) {
+    const date = this.fmtDate(this.selDate);
+    const availableStores = this.getSchedulableStores(date);
     const rows = times.map(time => {
       const atTime = appointments.filter(apt => normalizeTime(apt.time) === time);
-      const canAdd = (['admin', 'optometrist'].includes(DB.profile.role) || DB.profile.store_id) && !occupiedTimes.has(time);
+      const canAdd = availableStores.length && !occupiedTimes.has(time);
       return `<tr>
         <th>${time}</th>
         <td>
@@ -2546,18 +2817,19 @@ const App = {
               <span><span class="dot" style="background:${store?.color || '#64748b'}"></span>${esc(store?.name || 'Loja')}</span>
               <strong>${esc(apt.client_name)}</strong>
             </button>`;
-          }).join('') : (canAdd ? `<button class="mobile-simple-add" type="button" data-store="${DB.profile.role === 'store' ? DB.profile.store_id : stores[0]?.id}" data-time="${time}" title="Agendar"><i class="fas fa-plus"></i></button>` : '<span class="mobile-simple-blocked">Ocupado</span>')}
+          }).join('') : (canAdd ? `<button class="mobile-simple-add" type="button" data-store="${availableStores[0].id}" data-time="${time}" title="Agendar"><i class="fas fa-plus"></i></button>` : '<span class="schedule-empty-locked"><i class="fas fa-lock" aria-hidden="true"></i> Agenda bloqueada</span>')}
         </td>
       </tr>`;
     }).join('');
 
-    content.innerHTML = `${this.renderMobileAgendaControls()}
+    content.innerHTML = `${this.renderMobileAgendaControls()}${this.renderScheduleToolbar()}
       <div class="mobile-simple-table-wrap">
         <table class="mobile-simple-table">
           <tbody>${rows}</tbody>
         </table>
       </div>`;
     this.bindMobileAgendaControls(content);
+    this.bindScheduleToolbar(content);
     content.querySelectorAll('[data-apt-id]').forEach(button => {
       button.addEventListener('click', () => this.openAppointmentDetail(button.dataset.aptId));
     });
@@ -2573,12 +2845,13 @@ const App = {
     const dateStr = this.fmtDate(this.selDate);
     const times = getTimesForDate(this.selDate);
     const appointments = DB.appointments.filter(a => a.date === dateStr && a.status !== 'cancelled');
+    const availableStores = this.getSchedulableStores(dateStr);
     const sections = [
       { label: 'Manha', icon: 'fa-sun', times: times.filter(time => parseMinutes(time) < 13 * 60) },
       { label: 'Tarde', icon: 'fa-cloud-sun', times: times.filter(time => parseMinutes(time) >= 13 * 60) },
     ].filter(section => section.times.length);
 
-    let html = '<div class="simplified-view">';
+    let html = `${this.renderScheduleToolbar()}<div class="simplified-view">`;
 
     sections.forEach(section => {
       html += `<section class="simp-section">
@@ -2590,8 +2863,8 @@ const App = {
 
       section.times.forEach(time => {
         const atTime = appointments.filter(apt => normalizeTime(apt.time) === time);
-        const canAdd = ['admin', 'optometrist'].includes(DB.profile.role) || DB.profile.store_id;
-        html += `<td class="${atTime.length ? 'filled' : 'empty'}" data-time="${time}">
+        const canAdd = availableStores.length > 0;
+        html += `<td class="${atTime.length ? 'filled' : canAdd ? 'empty' : 'schedule-locked'}" data-time="${time}">
           ${atTime.length ? atTime.map(apt => {
             const store = DB.getStore(apt.store_id);
             const hasNewPrescription = this.hasUnreadPrescriptionForAppointment(apt);
@@ -2600,7 +2873,7 @@ const App = {
               <strong>${esc(apt.client_name)}</strong>
               ${hasNewPrescription ? '<span class="apt-rx-dot" title="Nova receita"></span>' : ''}
             </button>`;
-          }).join('') : (canAdd ? '<button class="simp-add" type="button"><i class="fas fa-plus"></i></button>' : '')}
+          }).join('') : (canAdd ? '<button class="simp-add" type="button" aria-label="Agendar"><i class="fas fa-plus"></i></button>' : '<span class="schedule-empty-locked"><i class="fas fa-lock" aria-hidden="true"></i> Bloqueado</span>')}
         </td>`;
       });
 
@@ -2609,12 +2882,13 @@ const App = {
 
     html += '</div>';
     document.getElementById('content').innerHTML = html;
+    this.bindScheduleToolbar(document.getElementById('content'));
     document.querySelectorAll('.simp-apt').forEach(card => {
       card.addEventListener('click', () => this.openAppointmentDetail(card.dataset.aptId));
     });
     document.querySelectorAll('.simp-table td.empty').forEach(cell => {
       cell.addEventListener('click', () => this.openAppointmentModal({
-        store_id: DB.profile.role === 'store' ? DB.profile.store_id : DB.stores[0]?.id,
+        store_id: availableStores[0]?.id,
         time: cell.dataset.time,
       }));
     });
@@ -2713,6 +2987,7 @@ const App = {
         <p>Crie lojas, logins e acompanhe o movimento geral.</p>
       </div>
       <div class="toolbar-actions">
+        <button class="btn btn-secondary" type="button" data-manage-schedule-blocks><i class="fas fa-lock" aria-hidden="true"></i> Bloquear agenda</button>
         <button class="btn btn-secondary" id="open-optometrist-form"><i class="fas fa-user-doctor"></i> Optometrista</button>
         <button class="btn btn-primary" id="open-store-form"><i class="fas fa-store"></i> Nova loja</button>
       </div>
@@ -2757,6 +3032,7 @@ const App = {
     </div>`;
 
     document.getElementById('content').innerHTML = html;
+    this.bindScheduleToolbar(document.getElementById('content'));
     document.getElementById('open-store-form').onclick = () => this.openStoreModal();
     document.getElementById('open-optometrist-form').onclick = () => this.openOptometristModal();
     document.querySelectorAll('[data-store-id]').forEach(row => {
@@ -2834,10 +3110,14 @@ const App = {
       return;
     }
 
-    const selectedStoreId = defaults.store_id || allowedStores[0].id;
-    const store = DB.getStore(selectedStoreId) || allowedStores[0];
     const dateValue = isSunday(this.selDate) ? this.fmtDate(nextOpenDate(this.selDate)) : this.fmtDate(this.selDate);
-    const initialTimes = this.getAvailableAppointmentTimes(dateValue);
+    const selectedStoreId = defaults.store_id || this.getSchedulableStores(dateValue)[0]?.id;
+    const store = allowedStores.find(item => item.id === selectedStoreId);
+    if (!store || DB.getScheduleBlocks(dateValue, store.id).length) {
+      this.toast('Agenda bloqueada para esta loja no dia escolhido. Escolha outra data ou desbloqueie o período.', 'error');
+      return;
+    }
+    const initialTimes = this.getAvailableAppointmentTimes(dateValue, null, store.id);
     if (!initialTimes.length && !defaults.time) {
       this.toast('Todos os horarios deste dia ja estao ocupados', 'error');
       return;
@@ -2896,20 +3176,25 @@ const App = {
     const appointmentForm = document.getElementById('appointment-form');
     const validatePhoneIdentity = this.bindAppointmentPhoneGuard(appointmentForm);
 
+    const updateAvailableTimes = () => {
+      const date = dateField.value;
+      const times = this.getAvailableAppointmentTimes(date, null, storeField.value);
+      document.getElementById('apt-time').innerHTML = times.map(t => `<option value="${t}">${t}</option>`).join('');
+      if (DB.getScheduleBlocks(date, storeField.value).length) this.toast('Agenda bloqueada para esta loja neste dia', 'error');
+      else if (isValidDateKey(date) && isSunday(parseLocalDate(date))) this.toast('Fechado aos domingos', 'error');
+      else if (!times.length) this.toast('Nenhum horário disponível neste dia', 'error');
+    };
+
     if (storeField.tagName === 'SELECT') storeField.onchange = event => {
       const selected = DB.getStore(event.target.value);
       document.getElementById('clients-list').innerHTML = DB.clients
         .filter(c => c.store_id === selected.id)
         .map(c => `<option value="${esc(c.name)}" data-phone="${esc(c.phone)}"></option>`)
         .join('');
+      updateAvailableTimes();
     };
 
-    if (dateField.type === 'date') dateField.onchange = event => {
-      const times = this.getAvailableAppointmentTimes(event.target.value);
-      document.getElementById('apt-time').innerHTML = times.map(t => `<option value="${t}">${t}</option>`).join('');
-      if (isSunday(parseLocalDate(event.target.value))) this.toast('Fechado aos domingos', 'error');
-      else if (!times.length) this.toast('Todos os horarios deste dia ja estao ocupados', 'error');
-    };
+    if (dateField.type === 'date') dateField.onchange = updateAvailableTimes;
 
     document.getElementById('apt-client').onchange = event => {
       const currentStore = document.getElementById('apt-store').value;
@@ -2923,6 +3208,10 @@ const App = {
     appointmentForm.onsubmit = async event => {
       event.preventDefault();
       const payload = this.readAppointmentForm();
+      if (DB.getScheduleBlocks(payload.date, payload.store_id).length) {
+        this.toast('Agenda bloqueada para esta loja no dia escolhido', 'error');
+        return;
+      }
       const phoneConflict = validatePhoneIdentity();
       if (phoneConflict) {
         this.toast(appointmentPhoneConflictMessage(phoneConflict), 'error');
@@ -2962,7 +3251,7 @@ const App = {
     const canEdit = DB.canManageStore(apt.store_id);
     const canViewPrescription = Boolean(client && DB.canManageStore(client.store_id));
     const currentTime = normalizeTime(apt.time);
-    const times = this.getAvailableAppointmentTimes(apt.date, apt.id);
+    const times = this.getAvailableAppointmentTimes(apt.date, apt.id, apt.store_id);
     if (!times.includes(currentTime)) times.push(currentTime);
     const currentPrescription = canViewPrescription ? parsePrescription(client?.prescription) : emptyPrescription();
     const newPrescription = canViewPrescription ? parsePrescription(client?.new_prescription) : emptyPrescription();
@@ -3033,11 +3322,12 @@ const App = {
 
     if (canEdit) {
       document.getElementById('apt-date')?.addEventListener('change', event => {
-        const availableTimes = this.getAvailableAppointmentTimes(event.target.value, apt.id);
+        const availableTimes = this.getAvailableAppointmentTimes(event.target.value, apt.id, apt.store_id);
         document.getElementById('apt-time').innerHTML = availableTimes
-          .map(t => `<option value="${t}">${t}</option>`)
+          .map(t => `<option value="${t}" ${event.target.value === apt.date && t === currentTime ? 'selected' : ''}>${t}</option>`)
           .join('');
-        if (isSunday(parseLocalDate(event.target.value))) this.toast('Fechado aos domingos', 'error');
+        if (!availableTimes.length && DB.getScheduleBlocks(event.target.value, apt.store_id).length) this.toast('Agenda bloqueada para esta loja neste dia', 'error');
+        else if (isValidDateKey(event.target.value) && isSunday(parseLocalDate(event.target.value))) this.toast('Fechado aos domingos', 'error');
         else if (!availableTimes.length) this.toast('Todos os horarios deste dia ja estao ocupados', 'error');
       });
     }
@@ -3621,7 +3911,15 @@ const App = {
     });
   },
 
-  getAvailableAppointmentTimes(date, ignoreId = null) {
+  getAvailableAppointmentTimes(date, ignoreId = null, storeId = null) {
+    if (!isValidDateKey(date)) return [];
+    const current = ignoreId ? DB.appointments.find(apt => apt.id === ignoreId) : null;
+    const targetStore = storeId || current?.store_id || (DB.profile?.role === 'store' ? DB.profile.store_id : null);
+    if ((targetStore && DB.getScheduleBlocks(date, targetStore).length)
+      || (!targetStore && !this.getSchedulableStores(date).length)) {
+      return current && current.date === date && current.store_id === targetStore && current.status !== 'cancelled'
+        ? [normalizeTime(current.time)] : [];
+    }
     return getTimesForDate(parseLocalDate(date))
       .filter(time => !this.isAppointmentSlotTaken(date, time, ignoreId));
   },
@@ -4041,6 +4339,7 @@ const App = {
     const modal = document.getElementById('modal');
     if (modal?.classList.contains('entry-request-overlay')) this.activeEntryRequestId = null;
     modal?.remove();
+    if (modal?.dataset.scheduleBlocks) document.querySelector('[data-manage-schedule-blocks]')?.focus();
   },
 
   toggleTheme() {
@@ -4212,6 +4511,18 @@ function sameDate(a, b) {
 function parseLocalDate(value) {
   const [y, m, d] = value.split('-').map(Number);
   return new Date(y, m - 1, d);
+}
+
+function isValidDateKey(value) {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const [year, month, day] = value.split('-').map(Number);
+  const date = parseLocalDate(value);
+  return date.getFullYear() === year && date.getMonth() === month - 1 && date.getDate() === day;
+}
+
+function sameAppointmentSlot(current, next) {
+  return current.store_id === next.store_id && current.date === next.date
+    && normalizeTime(current.time) === normalizeTime(next.time);
 }
 
 function addDays(date, days) {
