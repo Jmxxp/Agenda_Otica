@@ -3,8 +3,8 @@ const MONTHS = ['JANEIRO', 'FEVEREIRO', 'MARCO', 'ABRIL', 'MAIO', 'JUNHO', 'JULH
 const DEFAULT_COLORS = ['#ef4444', '#2563eb', '#16a34a', '#c084fc', '#f59e0b', '#0891b2', '#db2777', '#475569'];
 const MONDAY_TIMES = ['09:00', '09:30', '10:00', '10:30', '11:00', '11:30', '12:00'];
 const SATURDAY_TIMES = ['09:00', '09:30', '10:00', '10:30', '11:00', '11:30', '12:00', '12:30'];
-const FRIDAY_TIMES = ['14:00', '14:30', '15:00', '15:30', '16:00', '16:30', '17:00', '17:30'];
-const TUESDAY_TO_THURSDAY_TIMES = [
+const THURSDAY_AND_FRIDAY_TIMES = ['14:00', '14:30', '15:00', '15:30', '16:00', '16:30', '17:00', '17:30'];
+const TUESDAY_AND_WEDNESDAY_TIMES = [
   '08:00', '08:30', '09:00', '09:30', '10:00', '10:30',
   '11:00', '11:30', '12:00', '12:30', '13:00', '13:30',
   '14:00', '14:30', '15:00', '15:30', '16:00', '16:30',
@@ -3822,7 +3822,7 @@ const App = {
     <form class="modal-body form-stack store-form" id="store-form">
       <div class="store-form-note">
         <i class="fas fa-calendar-day"></i>
-        <span>Segunda das 09:00 as 12:00. Terca a quinta das 08:00 as 18:00. Sexta das 14:00 as 17:30. Sabado das 09:00 as 13:00.</span>
+        <span>Segunda das 09:00 as 12:00. Terca e quarta das 08:00 as 18:00. Quinta e sexta das 14:00 as 17:30. Sabado das 09:00 as 13:00.</span>
       </div>
       <label>Nome da loja
         <input type="text" id="store-name" placeholder="Loja Centro" value="${esc(store?.name || '')}" required>
@@ -4472,14 +4472,18 @@ function timesForStore() {
 
 function getTimesForDate(date) {
   if (isMonday(date)) return MONDAY_TIMES;
-  if (isFriday(date)) return FRIDAY_TIMES;
+  if (isThursday(date) || isFriday(date)) return THURSDAY_AND_FRIDAY_TIMES;
   if (isSaturday(date)) return SATURDAY_TIMES;
   if (isSunday(date)) return [];
-  return TUESDAY_TO_THURSDAY_TIMES;
+  return TUESDAY_AND_WEDNESDAY_TIMES;
 }
 
 function isMonday(date) {
   return date.getDay() === 1;
+}
+
+function isThursday(date) {
+  return date.getDay() === 4;
 }
 
 function isFriday(date) {
